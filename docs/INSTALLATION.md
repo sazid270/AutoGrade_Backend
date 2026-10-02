@@ -18,7 +18,7 @@ cd AutoGrade_Backend
 ```
 
 3. Run the Windows setup script from the project root. This creates and
-   configures `.venv-win`:
+   configures `.venv`:
 
    ```sh
    scripts\setup.bat
@@ -27,7 +27,7 @@ cd AutoGrade_Backend
 4. Activate the environment when opening a new terminal:
 
 ```sh
-.\.venv-win\Scripts\activate
+.\.venv\Scripts\activate
 ```
 
 5. Environment Setup

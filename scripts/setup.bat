@@ -4,12 +4,12 @@ setlocal
 REM Resolve project root (one level up from the scripts directory)
 pushd "%~dp0\.."
 
-REM Create a virtual environment in `.venv-win` if it doesn't already exist
-if not exist ".venv-win\Scripts\python.exe" (
+REM Create a virtual environment in `.venv` if it doesn't already exist
+if not exist ".venv\Scripts\python.exe" (
     echo Creating virtual environment...
-    py -3 -m venv .venv-win
+    py -3 -m venv .venv
     if errorlevel 1 (
-        python -m venv .venv-win
+        python -m venv .venv
         if errorlevel 1 (
             echo Failed to create virtual environment.
             popd
@@ -19,7 +19,7 @@ if not exist ".venv-win\Scripts\python.exe" (
 )
 
 REM Activate the virtual environment
-call ".venv-win\Scripts\activate.bat"
+call ".venv\Scripts\activate.bat"
 if errorlevel 1 (
     popd
     exit /b 1
