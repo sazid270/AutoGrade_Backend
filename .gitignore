@@ -1,0 +1,166 @@
+# Environment Variables
+.env
+.env.local
+.env.development
+.env.development.local
+.env.production
+.env.production.local
+.env.test
+.env.test.local
+
+# Python-related Files
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.pot
+*.pyc
+
+# Django-related Files
+db.sqlite3
+staticfiles/
+cache
+*.bak
+*.pyc
+**/migrations
+*.pot
+dump/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Sensitive or High-churn PyCharm Files
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/usage.statistics.xml
+.idea/**/dictionaries
+.idea/**/shelf
+.idea/**/aws.xml
+.idea/**/contentModel.xml
+.idea/**/dataSources/
+.idea/**/dataSources.ids
+.idea/**/dataSources.local.xml
+.idea/**/sqlDataSources.xml
+.idea/**/dynamic.xml
+.idea/**/uiDesigner.xml
+.idea/**/dbnavigator.xml
+
+# PyCharm File-based Project Format
+*.iws
+
+# PyCharm Generated Files
+.idea/**/gradle.xml
+.idea/**/libraries
+
+# PyCharm User-specific Stuff
+/.idea/djangoProject.iml
+/.idea/misc.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/vcs.xml
+
+# IntelliJ
+out/
+
+# JIRA Plugin
+atlassian-ide-plugin.xml
+
+# Gradle
+.gradle/
+.gradle/**
+**/gradle.xml
+
+# File-based project format
+*.iws
+
+# Backup Files
+*.bak
+
+# Installer Logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / Packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+*.manifest
+*.spec
+
+# Unit Test / Coverage Reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# pyenv
+.python-version
+
+# celery
+celerybeat-schedule.*
+
+# Environments
+.env.prod
+.env.test
+.venv
+.venv-*/
+env/
+venv/
+ENV/
+.ruff_cache/
+.mypy_cache/
+env.bak/
+venv.bak/
+
+# Logs
+logs
+
+# Docker
+docker
+
+# Visual Studio Code
+.vscode
+
+# Vercel
+.vercel
+
+# Data Files
+*.csv
+
+# Directories
+media/
+files/
+images/
+
+# Miscellaneous Files
+ddl.sql
+future_nations_ddl.sql
+model_schema_gen_command.txt
+optimize_cbf.ipynb
+
+# Specific Paths
+/app/modules/plp/universal_sentence_encoder/
+**/universal_sentence_encoder/
+
+# Service Account Key
+service-account-key.json

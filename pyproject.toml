@@ -1,0 +1,108 @@
+[project]
+name = "artzyne_backend"
+version = "1.0.0"
+description = "Backend API for Artzyne - A robust, artist-driven platform powered by scalable APIs, optimized performance, and seamless data management"
+requires-python = ">=3.10"
+
+dependencies = [
+    "Django~=4.2",
+    "django-cors-headers~=4.4.0",
+    "django-environ~=0.11.2",
+    "django-userforeignkey~=0.5.0",
+    "djangorestframework~=3.14.0",
+    "djangorestframework-simplejwt~=5.3.1",
+    "drf-yasg~=1.21.7",
+    "google-auth~=2.34.0",
+    "pillow~=12.1.1",
+    "requests~=2.32.3",
+    "sorl-thumbnail~=12.10.0",
+    "psycopg2-binary~=2.9.10",
+    "whitenoise~=6.9.0",
+    "gunicorn==21.2.0",
+]
+
+# Optional dev dependencies
+[project.optional-dependencies]
+dev = [
+    "isort~=8.0",
+    "pre-commit~=3.0",
+    "deptry~=0.24.0",
+    "django-stubs~=6.0.5",
+    "djangorestframework-stubs~=3.17.0",
+    "ruff~=0.15.16",
+]
+
+[tool.deptry]
+# Directories to exclude from dependency scanning
+exclude = [
+    "env/",
+    "venv/",
+    ".venv/",
+    "media/",
+    "staticfiles/",
+    ".*/migrations/",
+    ".*/tests/",
+    "docs/",
+]
+
+# Packages that are needed but not directly imported
+per_rule_ignores = { DEP002 = [
+    "django-cors-headers",  # Django CORS middleware configured in settings
+    "gunicorn",             # WSGI server for production
+    "psycopg2-binary",      # PostgreSQL adapter
+    "whitenoise",            # Static files serving
+    "pre-commit",            # Development hook runner
+    "deptry",                # Dependency auditing tool
+    "isort",                 # Import sorting tool
+    "django-stubs",          # Django type stubs
+    "djangorestframework-stubs",  # DRF type stubs
+    "ruff",                  # Linting and import sorting
+] }
+
+# Package name mappings (import name differs from package name)
+[tool.deptry.package_module_name_map]
+pillow = "PIL"
+pyyaml = "yaml"
+
+[tool.django-stubs]
+django_settings_module = "autograde.settings"
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+include = ["**/*.py", "**/*.pyi", "pyproject.toml"]
+exclude = [
+    ".git",
+    ".venv",
+    "env",
+    "venv",
+    "node_modules",
+    "build",
+    "dist",
+    "**/migrations/**",
+    "**/__pycache__/**"
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "DJ",
+    "UP",
+]
+ignore = [
+    "E501",
+    "DJ001"
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

@@ -1,0 +1,9 @@
+# Normalize line endings for text files
+* text=auto
+
+# Ensure shell scripts use LF line endings
+*.sh text eol=lf
+
+# Enforce LF for Python and markdown files too
+*.py text eol=lf
+*.md text eol=lf

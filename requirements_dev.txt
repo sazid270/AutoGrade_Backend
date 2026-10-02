@@ -1,0 +1,7 @@
+-r requirements.txt
+deptry~=0.24.0 # Finds unused dependencies, transitive dependencies, and misconfigured requirements
+isort~=8.0 # Import sorting tool
+pre-commit~=3.0 # Git hooks manager
+django-stubs~=6.0.5 # Type stubs for Django
+djangorestframework-stubs~=3.17.0 # Type stubs for Django REST Framework
+ruff~=0.15.16 # Fast Python linter
