@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "authorization",
     "app",
     "filesystem",
+    "omr",
 ]
 
 # Middleware

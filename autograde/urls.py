@@ -48,6 +48,7 @@ urlpatterns = [
     path("api/authorization/", include("authorization.urls")),
     path("api/app/", include("app.urls")),
     path("api/file/", include("filesystem.urls")),
+    path("api/omr/", include("omr.urls")),
     path("api-auth/", include("rest_framework.urls")),
 ]
 
