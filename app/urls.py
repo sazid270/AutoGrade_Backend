@@ -5,6 +5,7 @@ from app.views.exams import AnswerKeyView, ExamView, QuestionView
 from app.views.results import ResultView
 from app.views.scanning import (
     AnswerSheetView,
+    ExamScanConfigurationView,
     ScanBatchView,
     StudentAnswerView,
 )
@@ -22,6 +23,11 @@ router.register("answer-keys", AnswerKeyView, basename="answer-key")
 
 # Result url routes
 router.register("results", ResultView, basename="result")
+router.register(
+    "scan-configurations",
+    ExamScanConfigurationView,
+    basename="scan-configuration",
+)
 router.register("batches", ScanBatchView, basename="batch")
 router.register("sheets", AnswerSheetView, basename="sheet")
 router.register("student-answers", StudentAnswerView, basename="student-answer")

@@ -15,7 +15,7 @@ class ResultView(
 ):
     serializer_class = ResultSerializer
     swagger_tags = ["app_results"]
-    http_method_names = ("get", "head", "options", "patch", "post")
+    http_method_names = ["get", "patch", "post"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("exam", "student", "finalized")
 

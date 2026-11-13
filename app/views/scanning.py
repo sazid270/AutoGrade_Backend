@@ -4,17 +4,40 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from app.models.scanning import AnswerSheet, ScanBatch, StudentAnswer
+from app.models.scanning import (
+    AnswerSheet,
+    ExamScanConfiguration,
+    ScanBatch,
+    StudentAnswer,
+)
 from app.serializers.scanning import (
     AnswerSheetSerializer,
+    ExamScanConfigurationSerializer,
     ScanBatchSerializer,
     StudentAnswerSerializer,
 )
 
 
+class ExamScanConfigurationView(
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    serializer_class = ExamScanConfigurationSerializer
+    http_method_names = ["get", "patch"]
+    swagger_tags = ["app_scanning"]
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return ExamScanConfiguration.objects.none()
+        return ExamScanConfiguration.objects.filter(
+            exam__created_by=self.request.user
+        ).select_related("exam")
+
+
 class ScanBatchView(viewsets.ModelViewSet):
     serializer_class = ScanBatchSerializer
-    http_method_names = ("get", "head", "options", "post", "delete")
+    http_method_names = ["get", "post", "delete"]
     swagger_tags = ["app_scanning"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("exam", "status")
@@ -89,7 +112,7 @@ class AnswerSheetView(
 ):
     serializer_class = AnswerSheetSerializer
     swagger_tags = ["app_scanning"]
-    http_method_names = ("get", "head", "options", "post")
+    http_method_names = ["get", "post"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("batch", "status", "student")
 
@@ -134,7 +157,7 @@ class AnswerSheetView(
 class StudentAnswerView(viewsets.ModelViewSet):
     serializer_class = StudentAnswerSerializer
     swagger_tags = ["app_scanning"]
-    http_method_names = ("get", "head", "options", "patch")
+    http_method_names = ["get", "patch"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("sheet", "question", "flag", "is_overridden")
 

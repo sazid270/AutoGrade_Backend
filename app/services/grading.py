@@ -6,7 +6,7 @@ from django.utils import timezone
 
 from app.models.exams import AnswerKey, Exam, Question
 from app.models.results import Result
-from app.models.scanning import AnswerSheet, StudentAnswer
+from app.models.scanning import AnswerSheet, ExamScanConfiguration, StudentAnswer
 from app.models.students import Student
 from app.utils.omr import process_image
 from app.utils.student_keys import normalize_roll_no, normalize_student_key
@@ -16,7 +16,6 @@ def grade_answer(
     question: Question,
     selected_options: list[str],
     answer_key: AnswerKey | None,
-    exam: Exam,
 ) -> tuple[bool | None, Decimal]:
     if answer_key is None:
         return None, Decimal("0")
@@ -25,25 +24,37 @@ def grade_answer(
     if correct:
         return True, question.marks
     if selected:
-        return False, -exam.negative_marking
+        return False, Decimal("0")
     return False, Decimal("0")
 
 
 def validate_exam_template(exam: Exam) -> None:
+    if exam.exam_type != Exam.Type.MCQ:
+        raise ValueError("Only MCQ exams can be scanned at this time.")
+    if not exam.question_image:
+        raise ValueError("Upload the question image before scanning sheets.")
+    try:
+        configuration = exam.scan_configuration
+    except ExamScanConfiguration.DoesNotExist as exc:
+        raise ValueError("Configure the OMR template before scanning sheets.") from exc
+    template = configuration.omr_template
     expected_questions = set(
         exam.questions.filter(type=Question.Type.MCQ).values_list("number", flat=True)
     )
     template_questions = {
         int(item["number"])
-        for item in exam.omr_template.get("answers", [])
+        for item in template.get("answers", [])
         if isinstance(item, dict) and "number" in item
     }
-    answers = exam.omr_template.get("answers", [])
-    roll_columns = exam.omr_template.get("roll_number", {}).get("columns", [])
+    answers = template.get("answers", [])
+    roll_columns = template.get("roll_number", {}).get("columns", [])
+    roll_field = template.get("student_fields", {}).get("roll_no", {})
+    has_roll_field = bool(roll_columns or roll_field.get("columns"))
     if (
-        (expected_questions and not answers)
-        or not roll_columns
-        or "asymmetric_marker_corner" not in exam.omr_template
+        not expected_questions
+        or not answers
+        or not has_roll_field
+        or "asymmetric_marker_corner" not in template
         or expected_questions != template_questions
     ):
         raise ValueError("The OMR template does not match the exam MCQ questions.")
@@ -51,12 +62,10 @@ def validate_exam_template(exam: Exam) -> None:
         raise ValueError("The OMR template contains duplicate question numbers.")
     if any(len(column.get("bubbles", [])) != 10 for column in roll_columns):
         raise ValueError("Every roll-number column must contain 10 bubbles.")
-    question_total = sum(
-        question.marks for question in exam.questions.all()
-    )
-    if question_total != exam.total_marks:
-        raise ValueError("Exam total_marks must equal the sum of question marks.")
-    corner = exam.omr_template["asymmetric_marker_corner"]
+    question_total = sum(question.marks for question in exam.questions.all())
+    if question_total != exam.marks:
+        raise ValueError("Exam marks must equal the sum of question marks.")
+    corner = template["asymmetric_marker_corner"]
     if not isinstance(corner, int) or not 0 <= corner < 4:
         raise ValueError("asymmetric_marker_corner must be between 0 and 3.")
     questions = {
@@ -71,6 +80,8 @@ def validate_exam_template(exam: Exam) -> None:
             raise ValueError("OMR multiple-selection setting does not match question.")
         if not hasattr(question, "answer_key"):
             raise ValueError("Every MCQ must have an answer key before scanning.")
+        if question.answer_key.needs_review:
+            raise ValueError("Review every flagged answer key before scanning.")
 
 
 def _update_result(result: Result) -> None:
@@ -80,7 +91,6 @@ def _update_result(result: Result) -> None:
 
 
 def regrade_sheet(sheet: AnswerSheet) -> None:
-    exam = sheet.batch.exam
     answers = (
         sheet.answers.select_for_update()
         .select_related("question")
@@ -93,7 +103,6 @@ def regrade_sheet(sheet: AnswerSheet) -> None:
             answer.question,
             answer.selected_options,
             getattr(answer.question, "answer_key", None),
-            exam,
         )
         answer.save(update_fields=("is_correct", "marks_awarded"))
 
@@ -104,7 +113,7 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
     )
     data = process_image(
         initial_sheet.image.path,
-        initial_sheet.batch.exam.omr_template,
+        initial_sheet.batch.exam.scan_configuration.omr_template,
     )
 
     with transaction.atomic():
@@ -114,7 +123,16 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             .get(pk=sheet_id)
         )
         exam = sheet.batch.exam
-        detected_roll_no = data["roll_no"] or ""
+        fields = data.get("student_fields", {})
+        detected_roll_no = (
+            fields.get("roll_no", {}).get("value") or data["roll_no"] or ""
+        )
+        detected_registration_no = normalize_student_key(
+            fields.get("registration_no", {}).get("value", "")
+        )
+        detected_name = fields.get("name", {}).get("value", "")
+        detected_subject_code = fields.get("subject_code", {}).get("value", "")
+        detected_set_code = fields.get("set_code", {}).get("value", "")
         roll_no = normalize_roll_no(detected_roll_no)
         student = None
         duplicate = False
@@ -122,22 +140,55 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             student_key = {
                 "created_by": exam.created_by,
                 "institution": normalize_student_key(exam.institution),
-                "grade": normalize_student_key(exam.grade),
+                "grade": normalize_student_key(exam.class_or_batch),
                 "section": normalize_student_key(exam.section),
-                "academic_year": normalize_student_key(exam.academic_year),
+                "academic_year": normalize_student_key(exam.exam_year),
                 "roll_no": roll_no,
             }
-            try:
-                with transaction.atomic():
-                    student, _ = Student.objects.select_for_update().get_or_create(
-                        **student_key,
-                        defaults={
-                            "created_via": Student.CreatedVia.SCAN,
-                            "status": Student.Status.NEEDS_COMPLETION,
-                        },
+            if detected_registration_no:
+                student = (
+                    Student.objects.select_for_update()
+                    .filter(
+                        created_by=exam.created_by,
+                        institution=normalize_student_key(exam.institution),
+                        registration_no__iexact=detected_registration_no,
                     )
-            except IntegrityError:
-                student = Student.objects.select_for_update().get(**student_key)
+                    .first()
+                )
+            if student is None:
+                try:
+                    with transaction.atomic():
+                        student, _ = Student.objects.select_for_update().get_or_create(
+                            **student_key,
+                            defaults={
+                                "registration_no": detected_registration_no,
+                                "name": detected_name,
+                                "class_name": exam.class_or_batch,
+                                "created_via": Student.CreatedVia.SCAN,
+                                "status": Student.Status.NEEDS_COMPLETION,
+                            },
+                        )
+                except IntegrityError:
+                    student = (
+                        Student.objects.select_for_update()
+                        .filter(
+                            created_by=exam.created_by,
+                            institution=normalize_student_key(exam.institution),
+                            registration_no__iexact=detected_registration_no,
+                        )
+                        .first()
+                    )
+                    if student is None:
+                        student = Student.objects.select_for_update().get(**student_key)
+            changed_student_fields = []
+            if detected_registration_no and not student.registration_no:
+                student.registration_no = detected_registration_no
+                changed_student_fields.append("registration_no")
+            if detected_name and not student.name:
+                student.name = detected_name
+                changed_student_fields.append("name")
+            if changed_student_fields:
+                student.save(update_fields=changed_student_fields)
             duplicate = (
                 AnswerSheet.objects.filter(
                     batch__exam=exam,
@@ -156,6 +207,10 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
 
         sheet.student = student
         sheet.detected_roll_no = normalize_roll_no(detected_roll_no)
+        sheet.detected_registration_no = detected_registration_no
+        sheet.detected_name = detected_name
+        sheet.detected_subject_code = detected_subject_code
+        sheet.detected_set_code = detected_set_code
         sheet.roll_confidence = data["roll_confidence"]
         sheet.status = (
             AnswerSheet.Status.PROCESSED
@@ -164,6 +219,11 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             and all(
                 answer["flag"] not in {"multiple", "low_confidence"}
                 for answer in data["answers"].values()
+            )
+            and all(
+                field_data["flag"] == "ok"
+                for field_name, field_data in fields.items()
+                if field_name != "roll_no"
             )
             else AnswerSheet.Status.NEEDS_REVIEW
         )
@@ -175,6 +235,10 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             update_fields=(
                 "student",
                 "detected_roll_no",
+                "detected_registration_no",
+                "detected_name",
+                "detected_subject_code",
+                "detected_set_code",
                 "roll_confidence",
                 "status",
                 "error_message",
@@ -198,7 +262,6 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
                 question,
                 answer_data["selected_options"],
                 key,
-                exam,
             )
             StudentAnswer.objects.update_or_create(
                 sheet=sheet,
@@ -228,14 +291,9 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
 
 @transaction.atomic
 def regrade_result(result_id: int) -> Result:
-    result = (
-        Result.objects.select_for_update()
-        .select_related("exam")
-        .get(pk=result_id)
-    )
+    result = Result.objects.select_for_update().select_related("exam").get(pk=result_id)
     if result.finalized or result.is_overridden or not result.sheet_id:
         return result
-    exam = result.exam
     sheet = AnswerSheet.objects.select_for_update().get(pk=result.sheet_id)
     for answer in sheet.answers.select_related("question__answer_key").all():
         if answer.is_overridden:
@@ -245,7 +303,6 @@ def regrade_result(result_id: int) -> Result:
             answer.question,
             answer.selected_options,
             key,
-            exam,
         )
         answer.save(update_fields=("is_correct", "marks_awarded"))
     result.sheet = sheet
@@ -305,10 +362,11 @@ def resolve_sheet(
     if (
         normalize_student_key(student.institution)
         != normalize_student_key(exam.institution)
-        or normalize_student_key(student.grade) != normalize_student_key(exam.grade)
+        or normalize_student_key(student.grade)
+        != normalize_student_key(exam.class_or_batch)
         or normalize_student_key(student.section) != normalize_student_key(exam.section)
         or normalize_student_key(student.academic_year)
-        != normalize_student_key(exam.academic_year)
+        != normalize_student_key(exam.exam_year)
     ):
         raise ValueError("The student does not match the exam context.")
     if (

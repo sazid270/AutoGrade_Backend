@@ -50,27 +50,24 @@ class ResultSerializer(serializers.ModelSerializer):
                     "sheet": "Sheet, exam, and student must belong to the same account and exam."
                 }
             )
-        if self.instance and self.instance.finalized and attrs != {"finalized": False}:
-            raise serializers.ValidationError("Finalized results cannot be edited.")
-        if (
-            attrs.get("finalized")
-            and self.instance
-            and self.instance.sheet_id
-            and self.instance.sheet.status == "needs_review"
-        ):
-            raise serializers.ValidationError(
-                {"finalized": "Resolve the answer sheet before finalizing the result."}
-            )
         if {"mcq_marks", "cq_marks"} & set(attrs):
             mcq_marks = attrs.get(
                 "mcq_marks", getattr(self.instance, "mcq_marks", Decimal("0"))
             )
-            cq_marks = attrs.get(
-                "cq_marks", getattr(self.instance, "cq_marks", Decimal("0"))
-            ) or Decimal("0")
-            question_total = sum(question.marks for question in exam.questions.all())
-            if mcq_marks + cq_marks > question_total:
-                raise serializers.ValidationError("Marks cannot exceed question marks.")
+            cq_marks = (
+                attrs.get("cq_marks", getattr(self.instance, "cq_marks", Decimal("0")))
+                or Decimal("0")
+            )
+            if mcq_marks < 0 or cq_marks < 0:
+                raise serializers.ValidationError("Marks cannot be negative.")
+            if exam.exam_type == exam.Type.MCQ and cq_marks:
+                raise serializers.ValidationError(
+                    {"cq_marks": "CQ marks are not available for an MCQ exam."}
+                )
+            if mcq_marks + cq_marks > exam.marks:
+                raise serializers.ValidationError(
+                    "Marks cannot exceed the exam's total marks."
+                )
         return attrs
 
     def update(self, instance, validated_data):

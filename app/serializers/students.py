@@ -15,6 +15,10 @@ class StudentSerializer(serializers.ModelSerializer):
         for field in ("institution", "grade", "section", "academic_year"):
             validated_data[field] = normalize_student_key(validated_data.get(field))
         validated_data["roll_no"] = normalize_roll_no(validated_data.get("roll_no"))
+        if "registration_no" in validated_data:
+            validated_data["registration_no"] = normalize_student_key(
+                validated_data["registration_no"]
+            )
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
@@ -23,6 +27,10 @@ class StudentSerializer(serializers.ModelSerializer):
                 validated_data[field] = normalize_student_key(validated_data[field])
         if "roll_no" in validated_data:
             validated_data["roll_no"] = normalize_roll_no(validated_data["roll_no"])
+        if "registration_no" in validated_data:
+            validated_data["registration_no"] = normalize_student_key(
+                validated_data["registration_no"]
+            )
         return super().update(instance, validated_data)
 
     def validate(self, attrs):
@@ -53,8 +61,28 @@ class StudentSerializer(serializers.ModelSerializer):
                 }
             )
         attrs.update(values)
-        if not values["section"]:
+        registration_no = normalize_student_key(
+            attrs.get("registration_no", getattr(self.instance, "registration_no", ""))
+        )
+        if registration_no:
+            duplicate_registration = Student.objects.filter(
+                created_by=owner,
+                institution=values["institution"],
+                registration_no__iexact=registration_no,
+            )
+            if self.instance:
+                duplicate_registration = duplicate_registration.exclude(
+                    pk=self.instance.pk
+                )
+            if duplicate_registration.exists():
+                raise serializers.ValidationError(
+                    {
+                        "registration_no": "A student with this registration number already exists at this institution."
+                    }
+                )
+            attrs["registration_no"] = registration_no
+        if not values["roll_no"]:
             raise serializers.ValidationError(
-                {"section": "A section is required for student matching."}
+                {"roll_no": "A roll number is required."}
             )
         return attrs

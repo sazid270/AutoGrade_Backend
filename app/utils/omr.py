@@ -73,6 +73,41 @@ def read_bubbles(
     }
 
 
+def _read_student_field(
+    binary: Any,
+    config: dict[str, Any],
+    *,
+    threshold: float,
+    confidence_gap: float,
+    cv2: Any,
+) -> dict[str, Any]:
+    values = []
+    confidences = []
+    flags = []
+    for column in config.get("columns", []):
+        result = read_bubbles(
+            binary,
+            column["bubbles"],
+            threshold=threshold,
+            confidence_gap=confidence_gap,
+            cv2=cv2,
+        )
+        selected = result["selected"]
+        symbols = column.get("symbols", "0123456789")
+        if len(selected) != 1 or selected[0] >= len(symbols):
+            values.append("")
+        else:
+            values.append(symbols[selected[0]])
+        confidences.append(result["confidence"])
+        flags.append(result["flag"])
+    valid = bool(values) and all(flag == "ok" for flag in flags) and all(values)
+    return {
+        "value": "".join(values) if valid else "",
+        "confidence": min(confidences) if confidences else None,
+        "flag": "ok" if valid else "needs_review",
+    }
+
+
 def _align_image(image: Any, template: dict[str, Any], cv2: Any, np: Any) -> Any:
     width, height = template.get("warp_size", (2100, 2970))
     if template.get("alignment") == "none":
@@ -223,11 +258,31 @@ def process_image(
         if roll_values and all(value is not None for value in roll_values)
         else None
     )
+    student_fields = {
+        name: _read_student_field(
+            binary,
+            config,
+            threshold=threshold,
+            confidence_gap=confidence_gap,
+            cv2=cv2,
+        )
+        for name, config in template.get("student_fields", {}).items()
+    }
+    if "roll_no" in student_fields:
+        roll_no = student_fields["roll_no"]["value"] or None
+        roll_confidence = student_fields["roll_no"]["confidence"]
+        roll_flag = student_fields["roll_no"]["flag"]
+    else:
+        roll_confidence = min(roll_confidences) if roll_confidences else None
+        roll_flag = (
+            "ok"
+            if roll_no is not None and all(flag == "ok" for flag in roll_flags)
+            else "needs_review"
+        )
     return {
         "roll_no": roll_no,
-        "roll_confidence": min(roll_confidences) if roll_confidences else None,
-        "roll_flag": "ok"
-        if roll_no is not None and all(flag == "ok" for flag in roll_flags)
-        else "needs_review",
+        "roll_confidence": roll_confidence,
+        "roll_flag": roll_flag,
         "answers": answers,
+        "student_fields": student_fields,
     }

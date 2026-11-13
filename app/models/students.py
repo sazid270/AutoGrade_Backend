@@ -14,10 +14,11 @@ class Student(TimeStampMixin):
         MANUAL = "manual", "Manual"
         SCAN = "scan", "Scan"
 
-    institution = models.CharField(max_length=255)
+    institution = models.CharField(max_length=255, blank=True, default="")
     roll_no = models.CharField(max_length=32)
+    registration_no = models.CharField(max_length=64, blank=True)
     name = models.CharField(max_length=255, blank=True)
-    grade = models.CharField(max_length=32, blank=True)
+    grade = models.CharField(max_length=64, blank=True)
     class_name = models.CharField(max_length=64, blank=True)
     section = models.CharField(max_length=32, blank=True)
     academic_year = models.CharField(max_length=16, blank=True)
@@ -51,7 +52,12 @@ class Student(TimeStampMixin):
                     "roll_no",
                 ),
                 name="unique_student_roll_in_context",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=("created_by", "institution", "registration_no"),
+                condition=~models.Q(registration_no=""),
+                name="unique_student_registration_per_institution",
+            ),
         ]
         ordering = ("roll_no", "name")
 

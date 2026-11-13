@@ -2,14 +2,167 @@ from django.db import transaction
 from PIL import Image, UnidentifiedImageError
 from rest_framework import serializers
 
-from app.models.scanning import AnswerSheet, ScanBatch, StudentAnswer
+from app.models.scanning import (
+    AnswerSheet,
+    ExamScanConfiguration,
+    ScanBatch,
+    StudentAnswer,
+)
+from app.models.students import Student
 from app.services.grading import grade_answer
+from app.utils.student_keys import normalize_roll_no, normalize_student_key
 
 MAX_SCAN_IMAGE_SIZE = 20 * 1024 * 1024
 MAX_SCAN_IMAGE_DIMENSION = 10000
 MAX_SCAN_IMAGE_PIXELS = 40_000_000
 MAX_SCAN_REQUEST_SIZE = 200 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png"}
+
+
+class ExamScanConfigurationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExamScanConfiguration
+        fields = (
+            "exam",
+            "omr_template",
+            "answer_key_image",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("exam", "created_at", "updated_at")
+
+    def validate_omr_template(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("OMR template must be an object.")
+        warp_size = value.get("warp_size", (2100, 2970))
+        if (
+            not isinstance(warp_size, (list, tuple))
+            or len(warp_size) != 2
+            or not all(isinstance(item, int) and item > 0 for item in warp_size)
+        ):
+            raise serializers.ValidationError(
+                "warp_size must contain two positive integers."
+            )
+        answers = value.get("answers", [])
+        if not isinstance(answers, list):
+            raise serializers.ValidationError("answers must be a list.")
+        rois = []
+        for answer in answers:
+            if not isinstance(answer, dict) or not isinstance(
+                answer.get("bubbles"), list
+            ):
+                raise serializers.ValidationError(
+                    "Each answer needs a bubble ROI list."
+                )
+            rois.extend(answer["bubbles"])
+        roll = value.get("roll_number", {})
+        if not isinstance(roll, dict) or not isinstance(roll.get("columns", []), list):
+            raise serializers.ValidationError("roll_number.columns must be a list.")
+        for column in roll.get("columns", []):
+            if not isinstance(column, dict) or not isinstance(
+                column.get("bubbles"), list
+            ):
+                raise serializers.ValidationError("Each roll column needs bubble ROIs.")
+            rois.extend(column["bubbles"])
+        if len(roll.get("columns", [])) > 32:
+            raise serializers.ValidationError(
+                "roll_number cannot contain more than 32 columns."
+            )
+        student_fields = value.get("student_fields", {})
+        if not isinstance(student_fields, dict):
+            raise serializers.ValidationError("student_fields must be an object.")
+        allowed_student_fields = {
+            "name",
+            "roll_no",
+            "registration_no",
+            "subject_code",
+            "set_code",
+        }
+        max_lengths = {
+            "name": 255,
+            "roll_no": 32,
+            "registration_no": 64,
+            "subject_code": 32,
+            "set_code": 32,
+        }
+        for field_name, field_config in student_fields.items():
+            if field_name not in allowed_student_fields:
+                raise serializers.ValidationError(
+                    f"Unsupported student field: {field_name}."
+                )
+            if (
+                not isinstance(field_config, dict)
+                or not isinstance(field_config.get("columns"), list)
+                or not field_config["columns"]
+            ):
+                raise serializers.ValidationError(
+                    f"student_fields.{field_name}.columns must be a non-empty list."
+                )
+            if len(field_config["columns"]) > max_lengths[field_name]:
+                raise serializers.ValidationError(
+                    f"student_fields.{field_name} exceeds its maximum field length."
+                )
+            for column in field_config["columns"]:
+                if not isinstance(column, dict) or not isinstance(
+                    column.get("bubbles"), list
+                ):
+                    raise serializers.ValidationError(
+                        f"Each {field_name} column needs bubble ROIs."
+                    )
+                symbols = column.get("symbols", "0123456789")
+                if (
+                    not isinstance(symbols, str)
+                    or len(symbols) != len(column["bubbles"])
+                    or len(symbols) > 26
+                    or len(set(symbols)) != len(symbols)
+                    or not symbols
+                ):
+                    raise serializers.ValidationError(
+                        f"Each {field_name} column needs one symbol per bubble."
+                    )
+                rois.extend(column["bubbles"])
+        width, height = warp_size
+        for roi in rois:
+            if (
+                not isinstance(roi, list)
+                or len(roi) != 4
+                or not all(isinstance(item, int) for item in roi)
+                or roi[0] < 0
+                or roi[1] < 0
+                or roi[2] <= 0
+                or roi[3] <= 0
+                or roi[0] + roi[2] > width
+                or roi[1] + roi[3] > height
+            ):
+                raise serializers.ValidationError(
+                    "Every bubble ROI must lie within warp_size."
+                )
+        markers = value.get("corner_markers")
+        if markers is not None and (
+            not isinstance(markers, list)
+            or len(markers) != 4
+            or any(
+                not isinstance(point, list)
+                or len(point) != 2
+                or point[0] < 0
+                or point[1] < 0
+                or point[0] >= width
+                or point[1] >= height
+                for point in markers
+            )
+        ):
+            raise serializers.ValidationError(
+                "corner_markers must contain four destination points within warp_size."
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        template = validated_data.get("omr_template", instance.omr_template)
+        if instance.exam.batches.exists() and template != instance.omr_template:
+            raise serializers.ValidationError(
+                "The OMR template cannot change after sheets have been uploaded."
+            )
+        return super().update(instance, validated_data)
 
 
 class ScanBatchSerializer(serializers.ModelSerializer):
@@ -40,6 +193,14 @@ class ScanBatchSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if self.instance is not None:
             return attrs
+        exam = attrs.get("exam")
+        if exam:
+            from app.services.grading import validate_exam_template
+
+            try:
+                validate_exam_template(exam)
+            except ValueError as exc:
+                raise serializers.ValidationError({"exam": str(exc)}) from exc
         images = self.context["request"].FILES.getlist("images")
         if not images:
             raise serializers.ValidationError(
@@ -107,12 +268,59 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
             "image",
             "student",
             "status",
-            "detected_roll_no",
-            "detected_name",
             "roll_confidence",
             "error_message",
             "processed_at",
         )
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        sheet = super().update(instance, validated_data)
+        student = sheet.student
+        if student is None:
+            return sheet
+
+        updated_fields = []
+        if "detected_roll_no" in validated_data:
+            roll_no = normalize_roll_no(sheet.detected_roll_no)
+            duplicate = Student.objects.filter(
+                created_by=student.created_by,
+                institution=student.institution,
+                grade=student.grade,
+                section=student.section,
+                academic_year=student.academic_year,
+                roll_no=roll_no,
+            ).exclude(pk=student.pk)
+            if duplicate.exists():
+                raise serializers.ValidationError(
+                    {"detected_roll_no": "This roll number is already in use."}
+                )
+            student.roll_no = roll_no
+            updated_fields.append("roll_no")
+        for sheet_field, student_field in (
+            ("detected_registration_no", "registration_no"),
+            ("detected_name", "name"),
+        ):
+            if sheet_field in validated_data:
+                value = getattr(sheet, sheet_field)
+                if sheet_field == "detected_registration_no":
+                    value = normalize_student_key(value)
+                    duplicate = Student.objects.filter(
+                        created_by=student.created_by,
+                        institution=student.institution,
+                        registration_no=value,
+                    ).exclude(pk=student.pk)
+                    if value and duplicate.exists():
+                        raise serializers.ValidationError(
+                            {sheet_field: "This registration number is already in use."}
+                        )
+                    sheet.detected_registration_no = value
+                    sheet.save(update_fields=("detected_registration_no",))
+                setattr(student, student_field, value)
+                updated_fields.append(student_field)
+        if updated_fields:
+            student.save(update_fields=updated_fields)
+        return sheet
 
 
 class StudentAnswerSerializer(serializers.ModelSerializer):
@@ -170,8 +378,7 @@ class StudentAnswerSerializer(serializers.ModelSerializer):
                 {"selected_options": "This question allows only one option."}
             )
         key = getattr(question, "answer_key", None)
-        exam = question.exam
-        is_correct, marks = grade_answer(question, normalized, key, exam)
+        is_correct, marks = grade_answer(question, normalized, key)
         instance.selected_options = normalized
         instance.is_correct = is_correct
         instance.marks_awarded = marks

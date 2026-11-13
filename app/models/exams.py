@@ -9,31 +9,39 @@ from autograde.mixins.models import TimeStampMixin
 
 
 class Exam(TimeStampMixin):
+    class Type(models.TextChoices):
+        MCQ = "mcq", "MCQ"
+        CQ = "cq", "CQ"
+
     title = models.CharField(max_length=255)
     subject = models.CharField(max_length=128)
-    institution = models.CharField(max_length=255)
-    grade = models.CharField(max_length=32)
+    institution = models.CharField(max_length=255, blank=True, default="")
+    subject_code = models.CharField(max_length=32, blank=True)
+    set_code = models.CharField(max_length=32, blank=True)
+    class_or_batch = models.CharField(max_length=64)
     section = models.CharField(max_length=32, blank=True)
-    academic_year = models.CharField(max_length=16, blank=True)
-    date = models.DateField()
-    total_marks = models.DecimalField(
+    exam_year = models.CharField(max_length=16, blank=True)
+    exam_date = models.DateField()
+    exam_time = models.TimeField(blank=True, null=True)
+    exam_type = models.CharField(max_length=3, choices=Type.choices, default=Type.MCQ)
+    marks = models.DecimalField(
         max_digits=7,
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
     )
-    negative_marking = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=Decimal("0"),
-        validators=[MinValueValidator(Decimal("0"))],
-    )
-    omr_template = models.JSONField(default=dict, blank=True)
-    key_sheet_image = models.ImageField(
-        upload_to="answer-keys/%Y/%m/%d", blank=True, null=True
+    question_image = models.ImageField(
+        upload_to="questions/%Y/%m/%d", blank=True, null=True
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="exams"
     )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("created_by", "title"), name="unique_exam_title_per_teacher"
+            )
+        ]
 
     def __str__(self):
         return self.title

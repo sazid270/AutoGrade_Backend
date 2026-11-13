@@ -9,6 +9,7 @@ from app.serializers.students import StudentSerializer
 
 class StudentView(viewsets.ModelViewSet):
     serializer_class = StudentSerializer
+    http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_students"]
     filter_backends = (DjangoFilterBackend, filters.SearchFilter)
     filterset_fields = ("grade", "section", "status", "academic_year", "institution")

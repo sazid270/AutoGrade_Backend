@@ -8,6 +8,22 @@ from app.models.students import Student
 from autograde.mixins.models import TimeStampMixin
 
 
+class ExamScanConfiguration(TimeStampMixin):
+    exam = models.OneToOneField(
+        Exam,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="scan_configuration",
+    )
+    omr_template = models.JSONField(default=dict, blank=True)
+    answer_key_image = models.ImageField(
+        upload_to="answer-keys/%Y/%m/%d", blank=True, null=True
+    )
+
+    def __str__(self):
+        return f"Scan configuration for {self.exam}"
+
+
 class ScanBatch(TimeStampMixin):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -53,7 +69,10 @@ class AnswerSheet(models.Model):
         related_name="answer_sheets",
     )
     detected_roll_no = models.CharField(max_length=32, blank=True)
+    detected_registration_no = models.CharField(max_length=64, blank=True)
     detected_name = models.CharField(max_length=255, blank=True)
+    detected_subject_code = models.CharField(max_length=32, blank=True)
+    detected_set_code = models.CharField(max_length=32, blank=True)
     roll_confidence = models.FloatField(null=True, blank=True)
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.PENDING

@@ -1,108 +1,137 @@
 from django.db import transaction
+from django.utils.text import slugify
 from rest_framework import serializers
 
 from app.models.exams import AnswerKey, Exam, Question
+from app.models.scanning import ExamScanConfiguration
 from app.tasks import regrade_exam_task
 
 
+def _normalize_title_component(value):
+    return "".join(
+        character
+        for character in slugify(value, allow_unicode=True)
+        if character.isalnum()
+    )
+
+
+def _canonical_exam_title(title, subject, exam_year):
+    parts = (
+        _normalize_title_component(subject),
+        _normalize_title_component(title),
+        _normalize_title_component(exam_year),
+    )
+    return "-".join(parts) if all(parts) else None
+
+
+def _base_exam_title(title, subject, exam_year):
+    prefix = f"{_normalize_title_component(subject)}-"
+    suffix = f"-{_normalize_title_component(exam_year)}"
+    if (
+        prefix != "-"
+        and suffix != "-"
+        and title.startswith(prefix)
+        and title.endswith(suffix)
+    ):
+        return title[len(prefix) : -len(suffix)]
+    return title
+
+
 class ExamSerializer(serializers.ModelSerializer):
+    title = serializers.CharField(
+        max_length=255,
+        help_text="Normalized as subject-title-year using lowercase letters and numbers.",
+    )
+    exam_type = serializers.ChoiceField(
+        choices=Exam.Type.choices, default=Exam.Type.MCQ
+    )
+
     class Meta:
         model = Exam
         fields = "__all__"
-        read_only_fields = ("created_by", "created_at", "updated_at")
-
-    def create(self, validated_data):
-        return Exam.objects.create(
-            created_by=self.context["request"].user, **validated_data
+        read_only_fields = (
+            "created_by",
+            "created_at",
+            "updated_at",
         )
 
-    def validate_omr_template(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("OMR template must be an object.")
-        warp_size = value.get("warp_size", (2100, 2970))
-        if (
-            not isinstance(warp_size, (list, tuple))
-            or len(warp_size) != 2
-            or not all(isinstance(item, int) and item > 0 for item in warp_size)
-        ):
-            raise serializers.ValidationError(
-                "warp_size must contain two positive integers."
-            )
-        answers = value.get("answers", [])
-        if not isinstance(answers, list):
-            raise serializers.ValidationError("answers must be a list.")
-        rois = []
-        for answer in answers:
-            if not isinstance(answer, dict) or not isinstance(
-                answer.get("bubbles"), list
-            ):
-                raise serializers.ValidationError(
-                    "Each answer needs a bubble ROI list."
-                )
-            rois.extend(answer["bubbles"])
-        roll = value.get("roll_number", {})
-        if not isinstance(roll, dict) or not isinstance(roll.get("columns", []), list):
-            raise serializers.ValidationError("roll_number.columns must be a list.")
-        for column in roll.get("columns", []):
-            if not isinstance(column, dict) or not isinstance(
-                column.get("bubbles"), list
-            ):
-                raise serializers.ValidationError("Each roll column needs bubble ROIs.")
-            rois.extend(column["bubbles"])
-        width, height = warp_size
-        for roi in rois:
-            if (
-                not isinstance(roi, list)
-                or len(roi) != 4
-                or not all(isinstance(item, int) for item in roi)
-                or roi[0] < 0
-                or roi[1] < 0
-                or roi[2] <= 0
-                or roi[3] <= 0
-                or roi[0] + roi[2] > width
-                or roi[1] + roi[3] > height
-            ):
-                raise serializers.ValidationError(
-                    "Every bubble ROI must lie within warp_size."
-                )
-        markers = value.get("corner_markers")
-        if markers is not None and (
-            not isinstance(markers, list)
-            or len(markers) != 4
-            or any(
-                not isinstance(point, list)
-                or len(point) != 2
-                or point[0] < 0
-                or point[1] < 0
-                or point[0] >= width
-                or point[1] >= height
-                for point in markers
-            )
-        ):
-            raise serializers.ValidationError(
-                "corner_markers must contain four destination points within warp_size."
-            )
-        return value
+    @transaction.atomic
+    def create(self, validated_data):
+        exam = Exam.objects.create(
+            created_by=self.context["request"].user, **validated_data
+        )
+        ExamScanConfiguration.objects.create(exam=exam)
+        return exam
 
     def validate(self, attrs):
-        total_marks = attrs.get("total_marks")
-        if total_marks is not None and total_marks <= 0:
-            raise serializers.ValidationError({"total_marks": "Must be positive."})
-        if self.instance is None and not attrs.get("section", ""):
-            raise serializers.ValidationError(
-                {"section": "A section is required for student matching."}
+        marks = attrs.get("marks")
+        if marks is not None and marks <= 0:
+            raise serializers.ValidationError({"marks": "Must be positive."})
+        if self.instance is None and not attrs.get("exam_year", "").strip():
+            raise serializers.ValidationError({"exam_year": "This field is required."})
+        title_changed = any(
+            field in attrs for field in ("title", "subject", "exam_year")
+        )
+        if self.instance is not None and not title_changed:
+            return attrs
+
+        title = attrs.get("title")
+        if title is None and self.instance is not None:
+            title = _base_exam_title(
+                self.instance.title,
+                self.instance.subject,
+                self.instance.exam_year,
             )
+        subject = attrs.get("subject", getattr(self.instance, "subject", ""))
+        exam_year = attrs.get("exam_year", getattr(self.instance, "exam_year", ""))
+        canonical_title = _canonical_exam_title(title, subject, exam_year)
+        if canonical_title is None:
+            raise serializers.ValidationError(
+                {
+                    field: "Must contain at least one letter or number."
+                    for field, value in (
+                        ("title", title),
+                        ("subject", subject),
+                        ("exam_year", exam_year),
+                    )
+                    if not _normalize_title_component(value)
+                }
+            )
+        if len(canonical_title) > 255:
+            raise serializers.ValidationError(
+                {"title": "The normalized title must be 255 characters or fewer."}
+            )
+        attrs["title"] = canonical_title
+
+        owner = self.context["request"].user
+        existing_exams = Exam.objects.filter(created_by=owner)
+        if self.instance is not None:
+            existing_exams = existing_exams.exclude(pk=self.instance.pk)
+        for exam in existing_exams.only("title", "subject", "exam_year").iterator():
+            base_title = _base_exam_title(
+                exam.title,
+                exam.subject,
+                exam.exam_year,
+            )
+            if (
+                _canonical_exam_title(base_title, exam.subject, exam.exam_year)
+                == canonical_title
+            ):
+                raise serializers.ValidationError(
+                    {"title": "You already have an exam with this title."}
+                )
         return attrs
 
     def update(self, instance, validated_data):
         locked_fields = (
-            "grade",
+            "class_or_batch",
             "section",
             "institution",
-            "academic_year",
-            "omr_template",
+            "exam_year",
+            "exam_type",
+            "marks",
         )
-        if instance.batches.exclude(status="pending").exists() and any(
+        if instance.batches.exists() and any(
             field in validated_data
             and validated_data[field] != getattr(instance, field)
             for field in locked_fields
@@ -110,12 +139,7 @@ class ExamSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Exam identity fields cannot change after scanning begins."
             )
-        should_regrade = "negative_marking" in validated_data
-        with transaction.atomic():
-            instance = super().update(instance, validated_data)
-            if should_regrade:
-                transaction.on_commit(lambda: regrade_exam_task.delay(instance.pk))
-        return instance
+        return super().update(instance, validated_data)
 
 
 class QuestionSerializer(serializers.ModelSerializer):
@@ -142,14 +166,22 @@ class QuestionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         question = self.instance
         exam = attrs.get("exam", getattr(question, "exam", None))
+        if question is None and exam is not None and "type" not in attrs:
+            attrs["type"] = (
+                Question.Type.MCQ
+                if exam.exam_type == Exam.Type.MCQ
+                else Question.Type.CQ
+            )
         number = attrs.get("number", getattr(question, "number", None))
         duplicate = Question.objects.filter(exam=exam, number=number)
         if question is not None:
             if question.exam.batches.exists() and any(
-                field in attrs for field in ("number", "type", "options_count", "allow_multiple")
+                field in attrs
+                for field in ("number", "type", "options_count", "allow_multiple")
             ):
                 if any(
-                    attrs.get(field, getattr(question, field)) != getattr(question, field)
+                    attrs.get(field, getattr(question, field))
+                    != getattr(question, field)
                     for field in ("number", "type", "options_count", "allow_multiple")
                     if field in attrs
                 ):
@@ -160,6 +192,23 @@ class QuestionSerializer(serializers.ModelSerializer):
         if duplicate.exists():
             raise serializers.ValidationError(
                 {"number": "A question with this number already exists for the exam."}
+            )
+        question_type = attrs.get(
+            "type",
+            getattr(
+                question,
+                "type",
+                Question.Type.MCQ
+                if exam and exam.exam_type == Exam.Type.MCQ
+                else Question.Type.CQ,
+            ),
+        )
+        if exam and (
+            (exam.exam_type == Exam.Type.MCQ and question_type != Question.Type.MCQ)
+            or (exam.exam_type == Exam.Type.CQ and question_type != Question.Type.CQ)
+        ):
+            raise serializers.ValidationError(
+                {"type": "Question type must match the exam type."}
             )
         if question is not None:
             key = getattr(question, "answer_key", None)
@@ -268,11 +317,9 @@ class AnswerKeySerializer(serializers.ModelSerializer):
         return instance
 
     def update(self, instance, validated_data):
-        options_changed = (
-            "correct_options" in validated_data
-            and sorted(validated_data["correct_options"])
-            != sorted(instance.correct_options)
-        )
+        options_changed = "correct_options" in validated_data and sorted(
+            validated_data["correct_options"]
+        ) != sorted(instance.correct_options)
         if not instance.needs_review and not options_changed:
             return instance
         validated_data["source"] = AnswerKey.Source.MANUAL_EDIT

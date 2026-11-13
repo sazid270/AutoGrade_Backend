@@ -1,4 +1,6 @@
+from django.db import transaction
 from django.db.models import ProtectedError
+from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
@@ -14,10 +16,18 @@ from app.serializers.exams import (
 
 class ExamView(viewsets.ModelViewSet):
     serializer_class = ExamSerializer
+    http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_exams"]
     filter_backends = (DjangoFilterBackend, filters.SearchFilter)
-    filterset_fields = ("subject", "grade", "section", "date")
-    search_fields = ("title", "subject")
+    filterset_fields = (
+        "subject",
+        "class_or_batch",
+        "section",
+        "exam_year",
+        "exam_date",
+        "exam_type",
+    )
+    search_fields = ("title", "subject", "subject_code")
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
@@ -25,31 +35,92 @@ class ExamView(viewsets.ModelViewSet):
         return Exam.objects.filter(created_by=self.request.user)
 
     def destroy(self, request, *args, **kwargs):
-        exam = self.get_object()
-        if exam.batches.exists():
-            return Response(
-                {"detail": "Exams cannot be deleted after scanning begins."},
-                status=status.HTTP_409_CONFLICT,
+        with transaction.atomic():
+            exam = self.get_object()
+            exam = get_object_or_404(
+                self.filter_queryset(self.get_queryset()).select_for_update(),
+                pk=exam.pk,
             )
+            self.check_object_permissions(request, exam)
+            if (
+                exam.questions.exists()
+                or exam.batches.exists()
+                or exam.results.exists()
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "An exam with questions, scan batches, or results "
+                            "cannot be deleted."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            try:
+                return super().destroy(request, *args, **kwargs)
+            except ProtectedError:
+                return Response(
+                    {
+                        "detail": (
+                            "This exam cannot be deleted because related records "
+                            "depend on it."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+    @action(detail=True, methods=("get",), url_path="answer-key-preview")
+    def answer_key_preview(self, request, **kwargs):
+        exam = self._get_exam_for_action(request, kwargs)
+        return Response(self._answer_key_preview_data(exam))
+
+    def _get_exam_for_action(self, request, kwargs):
+        exam = get_object_or_404(
+            self.filter_queryset(self.get_queryset()),
+            pk=kwargs["pk"],
+        )
+        self.check_object_permissions(request, exam)
+        return exam
+
+    @staticmethod
+    def _answer_key_preview_data(exam):
+        from app.services.grading import validate_exam_template
+
+        questions = []
+        for question in exam.questions.all():
+            answer_key = getattr(question, "answer_key", None)
+            questions.append(
+                {
+                    "question": question.pk,
+                    "number": question.number,
+                    "marks": question.marks,
+                    "options_count": question.options_count,
+                    "correct_options": answer_key.correct_options if answer_key else [],
+                    "source": answer_key.source if answer_key else None,
+                    "needs_review": answer_key.needs_review if answer_key else False,
+                }
+            )
+        readiness_error = None
         try:
-            return super().destroy(request, *args, **kwargs)
-        except ProtectedError:
-            return Response(
-                {"detail": "This exam cannot be deleted because it has results."},
-                status=status.HTTP_409_CONFLICT,
-            )
-
-    @action(detail=True, methods=("post",))
-    def regrade(self, request, pk=None):
-        from app.tasks import regrade_exam_task
-
-        exam = self.get_object()
-        task = regrade_exam_task.delay(exam.pk)
-        return Response({"status": "queued", "task_id": task.id})
+            validate_exam_template(exam)
+        except ValueError as exc:
+            readiness_error = str(exc)
+        scan_configuration = getattr(exam, "scan_configuration", None)
+        return {
+            "exam": exam.pk,
+            "ready_for_scanning": readiness_error is None,
+            "readiness_error": readiness_error,
+            "question_image": exam.question_image.url if exam.question_image else None,
+            "answer_key_image": scan_configuration.answer_key_image.url
+            if scan_configuration and scan_configuration.answer_key_image
+            else None,
+            "questions": questions,
+        }
 
 
 class QuestionView(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
+    http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_questions"]
     filterset_fields = ("exam", "type")
 
@@ -70,6 +141,7 @@ class QuestionView(viewsets.ModelViewSet):
 
 class AnswerKeyView(viewsets.ModelViewSet):
     serializer_class = AnswerKeySerializer
+    http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_answer_keys"]
     filterset_fields = ("question__exam", "source", "needs_review")
 
