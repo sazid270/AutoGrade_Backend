@@ -52,10 +52,12 @@ INSTALLED_APPS = [
     "sorl.thumbnail",
     "corsheaders",
     "rest_framework",
+    "django_filters",
     "drf_yasg",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
     "django_userforeignkey",
+    "simple_history",
     # Custom apps
     "authentication",
     "authorization",
@@ -75,6 +77,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django_userforeignkey.middleware.UserForeignKeyMiddleware",
+    "simple_history.middleware.HistoryRequestMiddleware",
 ]
 
 ROOT_URLCONF = "autograde.urls"
@@ -172,11 +175,16 @@ AUTHENTICATION_BACKENDS = ("django.contrib.auth.backends.ModelBackend",)
 # Django REST Framework configuration
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
+        ("rest_framework.authentication.BasicAuthentication",) if DEBUG else ()
+    )
+    + (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.BasicAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
+    "PAGE_SIZE": 50,
+    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    "DEFAULT_FILTER_BACKENDS": ("django_filters.rest_framework.DjangoFilterBackend",),
 }
 
 
@@ -261,6 +269,14 @@ else:
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_HTTPONLY = True
     CSRF_COOKIE_HTTPONLY = True
+
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=CELERY_BROKER_URL)
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_TIME_LIMIT = 900
+CELERY_TASK_SOFT_TIME_LIMIT = 840
+DATA_UPLOAD_MAX_NUMBER_FILES = 500
 
 # Additional CORS settings
 CORS_ALLOW_CREDENTIALS = True
