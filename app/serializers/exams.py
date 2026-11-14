@@ -177,6 +177,13 @@ class QuestionSerializer(serializers.ModelSerializer):
     def get_question_image_urls(self, obj):
         return [image.image.url for image in obj.question_images.all() if image.image]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.exam.exam_type != Exam.Type.MCQ:
+            data.pop("options_count", None)
+            data.pop("allow_multiple", None)
+        return data
+
     def get_extra_kwargs(self):
         extra_kwargs = super().get_extra_kwargs()
         if self.instance is not None:
@@ -208,6 +215,21 @@ class QuestionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"exam": "The exam cannot be changed after question creation."}
             )
+        exam = attrs.get("exam", question.exam if question is not None else None)
+        if exam is not None and exam.exam_type != Exam.Type.MCQ:
+            mcq_fields = ("options_count", "allow_multiple")
+            supplied_fields = [
+                field for field in mcq_fields if field in self.initial_data
+            ]
+            if supplied_fields:
+                raise serializers.ValidationError(
+                    {
+                        field: "This field is only valid for MCQ exams."
+                        for field in supplied_fields
+                    }
+                )
+            for field in mcq_fields:
+                attrs.pop(field, None)
         if question is not None:
             if question.exam.batches.exists() and any(
                 field in attrs

@@ -91,18 +91,19 @@ class ExamView(viewsets.ModelViewSet):
             "question_images", "answer_key"
         ):
             answer_key = getattr(question, "answer_key", None)
-            questions.append(
-                {
-                    "id": question.pk,
-                    "question_images": [
-                        image.image.url for image in question.question_images.all()
-                    ],
-                    "options_count": question.options_count,
-                    "correct_options": answer_key.correct_options if answer_key else [],
-                    "source": answer_key.source if answer_key else None,
-                    "needs_review": answer_key.needs_review if answer_key else False,
-                }
-            )
+            question_data = {
+                "id": question.pk,
+                "question_images": [
+                    image.image.url for image in question.question_images.all()
+                ],
+                "correct_options": answer_key.correct_options if answer_key else [],
+                "source": answer_key.source if answer_key else None,
+                "needs_review": answer_key.needs_review if answer_key else False,
+            }
+            if exam.exam_type == Exam.Type.MCQ:
+                question_data["options_count"] = question.options_count
+                question_data["allow_multiple"] = question.allow_multiple
+            questions.append(question_data)
         readiness_error = None
         try:
             validate_exam_template(exam)
