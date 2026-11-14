@@ -226,8 +226,8 @@ def process_image(
 
     answers = {}
     for question in template.get("answers", []):
-        number = str(question["number"])
-        answers[number] = read_bubbles(
+        question_id = str(question["question_id"])
+        answers[question_id] = read_bubbles(
             binary,
             question["bubbles"],
             threshold=threshold,

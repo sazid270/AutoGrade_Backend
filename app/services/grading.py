@@ -1,10 +1,8 @@
-from decimal import Decimal
-
 from django.db import IntegrityError, transaction
 from django.db.models import Prefetch
 from django.utils import timezone
 
-from app.models.exams import AnswerKey, Exam, Question
+from app.models.exams import AnswerKey, Exam
 from app.models.results import Result
 from app.models.scanning import AnswerSheet, ExamScanConfiguration, StudentAnswer
 from app.models.students import Student
@@ -13,67 +11,57 @@ from app.utils.student_keys import normalize_roll_no, normalize_student_key
 
 
 def grade_answer(
-    question: Question,
     selected_options: list[str],
     answer_key: AnswerKey | None,
-) -> tuple[bool | None, Decimal]:
+) -> bool | None:
     if answer_key is None:
-        return None, Decimal("0")
+        return None
     selected = sorted({str(option).strip().upper() for option in selected_options})
-    correct = selected == sorted(answer_key.correct_options)
-    if correct:
-        return True, question.marks
-    if selected:
-        return False, Decimal("0")
-    return False, Decimal("0")
+    return selected == sorted(answer_key.correct_options)
 
 
 def validate_exam_template(exam: Exam) -> None:
     if exam.exam_type != Exam.Type.MCQ:
         raise ValueError("Only MCQ exams can be scanned at this time.")
-    if not exam.question_image:
-        raise ValueError("Upload the question image before scanning sheets.")
     try:
         configuration = exam.scan_configuration
     except ExamScanConfiguration.DoesNotExist as exc:
         raise ValueError("Configure the OMR template before scanning sheets.") from exc
     template = configuration.omr_template
-    expected_questions = set(
-        exam.questions.filter(type=Question.Type.MCQ).values_list("number", flat=True)
-    )
+    questions = list(exam.questions.all())
+    expected_questions = {question.pk for question in questions}
+    if not expected_questions:
+        raise ValueError("Add at least one MCQ question before scanning sheets.")
+    if any(not question.question_images.exists() for question in questions):
+        raise ValueError(
+            "Upload at least one image for every MCQ question before scanning sheets."
+        )
     template_questions = {
-        int(item["number"])
+        int(item["question_id"])
         for item in template.get("answers", [])
-        if isinstance(item, dict) and "number" in item
+        if isinstance(item, dict) and "question_id" in item
     }
     answers = template.get("answers", [])
     roll_columns = template.get("roll_number", {}).get("columns", [])
     roll_field = template.get("student_fields", {}).get("roll_no", {})
     has_roll_field = bool(roll_columns or roll_field.get("columns"))
     if (
-        not expected_questions
-        or not answers
+        not answers
         or not has_roll_field
         or "asymmetric_marker_corner" not in template
         or expected_questions != template_questions
     ):
         raise ValueError("The OMR template does not match the exam MCQ questions.")
     if len(template_questions) != len(answers):
-        raise ValueError("The OMR template contains duplicate question numbers.")
+        raise ValueError("The OMR template contains duplicate question IDs.")
     if any(len(column.get("bubbles", [])) != 10 for column in roll_columns):
         raise ValueError("Every roll-number column must contain 10 bubbles.")
-    question_total = sum(question.marks for question in exam.questions.all())
-    if question_total != exam.marks:
-        raise ValueError("Exam marks must equal the sum of question marks.")
     corner = template["asymmetric_marker_corner"]
     if not isinstance(corner, int) or not 0 <= corner < 4:
         raise ValueError("asymmetric_marker_corner must be between 0 and 3.")
-    questions = {
-        question.number: question
-        for question in exam.questions.filter(type=Question.Type.MCQ).all()
-    }
+    questions_by_id = {question.pk: question for question in questions}
     for item in answers:
-        question = questions[int(item["number"])]
+        question = questions_by_id[int(item["question_id"])]
         if len(item.get("bubbles", [])) != question.options_count:
             raise ValueError("OMR bubble count does not match question options.")
         if bool(item.get("allow_multiple", False)) != question.allow_multiple:
@@ -99,11 +87,10 @@ def regrade_sheet(sheet: AnswerSheet) -> None:
     for answer in answers:
         if answer.is_overridden:
             continue
-        answer.is_correct, answer.marks_awarded = grade_answer(
-            answer.question,
-            answer.selected_options,
-            getattr(answer.question, "answer_key", None),
+        answer.is_correct = grade_answer(
+            answer.selected_options, getattr(answer.question, "answer_key", None)
         )
+        answer.marks_awarded = 0
         answer.save(update_fields=("is_correct", "marks_awarded"))
 
 
@@ -247,22 +234,22 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
         )
 
         questions = {
-            question.number: question
+            question.pk: question
             for question in exam.questions.select_related("answer_key").all()
         }
-        for number, answer_data in data["answers"].items():
-            question = questions[int(number)]
+        for question_id, answer_data in data["answers"].items():
+            question = questions[int(question_id)]
             key = getattr(question, "answer_key", None)
             existing = StudentAnswer.objects.filter(
                 sheet=sheet, question=question
             ).first()
             if existing and existing.is_overridden:
                 continue
-            is_correct, marks = grade_answer(
-                question,
+            is_correct = grade_answer(
                 answer_data["selected_options"],
                 key,
             )
+            marks = 0
             StudentAnswer.objects.update_or_create(
                 sheet=sheet,
                 question=question,
@@ -299,11 +286,11 @@ def regrade_result(result_id: int) -> Result:
         if answer.is_overridden:
             continue
         key = getattr(answer.question, "answer_key", None)
-        answer.is_correct, answer.marks_awarded = grade_answer(
-            answer.question,
+        answer.is_correct = grade_answer(
             answer.selected_options,
             key,
         )
+        answer.marks_awarded = 0
         answer.save(update_fields=("is_correct", "marks_awarded"))
     result.sheet = sheet
     _update_result(result)

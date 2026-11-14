@@ -5,6 +5,7 @@ from rest_framework import serializers
 from app.models.exams import AnswerKey, Exam, Question
 from app.models.scanning import ExamScanConfiguration
 from app.tasks import regrade_exam_task
+from filesystem.models.models import ImageModel
 
 
 def _normalize_title_component(value):
@@ -143,9 +144,38 @@ class ExamSerializer(serializers.ModelSerializer):
 
 
 class QuestionSerializer(serializers.ModelSerializer):
+    question_images = serializers.PrimaryKeyRelatedField(
+        queryset=ImageModel.objects.all(),
+        many=True,
+        required=True,
+        allow_empty=False,
+        help_text="Image IDs returned by POST /api/file/image/.",
+    )
+    question_image_urls = serializers.SerializerMethodField()
+
     class Meta:
         model = Question
-        fields = "__all__"
+        fields = (
+            "id",
+            "exam",
+            "question_images",
+            "question_image_urls",
+            "options_count",
+            "allow_multiple",
+        )
+        extra_kwargs = {
+            "options_count": {
+                "default": 4,
+                "help_text": "Number of MCQ choices; defaults to 4 (A-D).",
+            },
+            "allow_multiple": {
+                "default": False,
+                "help_text": "Whether multiple choices may be selected.",
+            },
+        }
+
+    def get_question_image_urls(self, obj):
+        return [image.image.url for image in obj.question_images.all() if image.image]
 
     def get_extra_kwargs(self):
         extra_kwargs = super().get_extra_kwargs()
@@ -163,64 +193,52 @@ class QuestionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("You cannot use another user's exam.")
         return value
 
+    def validate_question_images(self, value):
+        if any(
+            image.created_by_id != self.context["request"].user.id for image in value
+        ):
+            raise serializers.ValidationError(
+                "You can only use images that you uploaded."
+            )
+        return value
+
     def validate(self, attrs):
         question = self.instance
-        exam = attrs.get("exam", getattr(question, "exam", None))
-        if question is None and exam is not None and "type" not in attrs:
-            attrs["type"] = (
-                Question.Type.MCQ
-                if exam.exam_type == Exam.Type.MCQ
-                else Question.Type.CQ
+        if question is not None and "exam" in self.initial_data:
+            raise serializers.ValidationError(
+                {"exam": "The exam cannot be changed after question creation."}
             )
-        number = attrs.get("number", getattr(question, "number", None))
-        duplicate = Question.objects.filter(exam=exam, number=number)
         if question is not None:
             if question.exam.batches.exists() and any(
                 field in attrs
-                for field in ("number", "type", "options_count", "allow_multiple")
+                for field in (
+                    "question_images",
+                    "options_count",
+                    "allow_multiple",
+                )
             ):
                 if any(
-                    attrs.get(field, getattr(question, field))
-                    != getattr(question, field)
-                    for field in ("number", "type", "options_count", "allow_multiple")
-                    if field in attrs
+                    (
+                        sorted(image.pk for image in attrs[field])
+                        != sorted(question.question_images.values_list("pk", flat=True))
+                        if field == "question_images"
+                        else attrs[field] != getattr(question, field)
+                    )
+                    for field in attrs
                 ):
                     raise serializers.ValidationError(
-                        "Question identity and OMR settings cannot change after scanning begins."
+                        "Question fields cannot change after scanning begins."
                     )
-            duplicate = duplicate.exclude(pk=question.pk)
-        if duplicate.exists():
-            raise serializers.ValidationError(
-                {"number": "A question with this number already exists for the exam."}
-            )
-        question_type = attrs.get(
-            "type",
-            getattr(
-                question,
-                "type",
-                Question.Type.MCQ
-                if exam and exam.exam_type == Exam.Type.MCQ
-                else Question.Type.CQ,
-            ),
-        )
-        if exam and (
-            (exam.exam_type == Exam.Type.MCQ and question_type != Question.Type.MCQ)
-            or (exam.exam_type == Exam.Type.CQ and question_type != Question.Type.CQ)
-        ):
-            raise serializers.ValidationError(
-                {"type": "Question type must match the exam type."}
-            )
         if question is not None:
             key = getattr(question, "answer_key", None)
             if key:
                 options_count = attrs.get("options_count", question.options_count)
-                question_type = attrs.get("type", question.type)
                 allow_multiple = attrs.get("allow_multiple", question.allow_multiple)
                 options = key.correct_options
                 allowed = {chr(ord("A") + index) for index in range(options_count)}
-                if question_type != Question.Type.MCQ or not set(options).issubset(
-                    allowed
-                ):
+                if question.exam.exam_type != Exam.Type.MCQ or not set(
+                    options
+                ).issubset(allowed):
                     raise serializers.ValidationError(
                         "Question changes would invalidate its answer key."
                     )
@@ -239,12 +257,7 @@ class QuestionSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        should_regrade = "marks" in validated_data
-        with transaction.atomic():
-            instance = super().update(instance, validated_data)
-            if should_regrade:
-                transaction.on_commit(lambda: regrade_exam_task.delay(instance.exam_id))
-        return instance
+        return super().update(instance, validated_data)
 
 
 class AnswerKeySerializer(serializers.ModelSerializer):
@@ -277,7 +290,7 @@ class AnswerKeySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"question": "You cannot use another user's question."}
             )
-        if question.type != Question.Type.MCQ:
+        if question.exam.exam_type != Exam.Type.MCQ:
             raise serializers.ValidationError(
                 {"question": "CQ questions cannot have an OMR answer key."}
             )

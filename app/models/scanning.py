@@ -112,4 +112,4 @@ class StudentAnswer(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.sheet} - Question {self.question.number}"
+        return f"{self.sheet} - Question {self.question_id}"

@@ -87,13 +87,16 @@ class ExamView(viewsets.ModelViewSet):
         from app.services.grading import validate_exam_template
 
         questions = []
-        for question in exam.questions.all():
+        for question in exam.questions.prefetch_related(
+            "question_images", "answer_key"
+        ):
             answer_key = getattr(question, "answer_key", None)
             questions.append(
                 {
-                    "question": question.pk,
-                    "number": question.number,
-                    "marks": question.marks,
+                    "id": question.pk,
+                    "question_images": [
+                        image.image.url for image in question.question_images.all()
+                    ],
                     "options_count": question.options_count,
                     "correct_options": answer_key.correct_options if answer_key else [],
                     "source": answer_key.source if answer_key else None,
@@ -110,7 +113,6 @@ class ExamView(viewsets.ModelViewSet):
             "exam": exam.pk,
             "ready_for_scanning": readiness_error is None,
             "readiness_error": readiness_error,
-            "question_image": exam.question_image.url if exam.question_image else None,
             "answer_key_image": scan_configuration.answer_key_image.url
             if scan_configuration and scan_configuration.answer_key_image
             else None,
@@ -122,12 +124,14 @@ class QuestionView(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
     http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_questions"]
-    filterset_fields = ("exam", "type")
+    filterset_fields = ("exam",)
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return Question.objects.none()
-        return Question.objects.filter(exam__created_by=self.request.user)
+        return Question.objects.filter(
+            exam__created_by=self.request.user
+        ).prefetch_related("question_images")
 
     def destroy(self, request, *args, **kwargs):
         question = self.get_object()

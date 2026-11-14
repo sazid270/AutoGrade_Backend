@@ -47,14 +47,24 @@ class ExamScanConfigurationSerializer(serializers.ModelSerializer):
         if not isinstance(answers, list):
             raise serializers.ValidationError("answers must be a list.")
         rois = []
+        question_ids = []
         for answer in answers:
-            if not isinstance(answer, dict) or not isinstance(
-                answer.get("bubbles"), list
+            if (
+                not isinstance(answer, dict)
+                or not isinstance(answer.get("bubbles"), list)
+                or not isinstance(answer.get("question_id"), int)
+                or isinstance(answer.get("question_id"), bool)
+                or answer["question_id"] <= 0
             ):
                 raise serializers.ValidationError(
-                    "Each answer needs a bubble ROI list."
+                    "Each answer needs a question_id and bubble ROI list."
                 )
+            question_ids.append(answer["question_id"])
             rois.extend(answer["bubbles"])
+        if len(question_ids) != len(set(question_ids)):
+            raise serializers.ValidationError(
+                "Each question_id can only appear once in the OMR template."
+            )
         roll = value.get("roll_number", {})
         if not isinstance(roll, dict) or not isinstance(roll.get("columns", []), list):
             raise serializers.ValidationError("roll_number.columns must be a list.")
@@ -378,10 +388,10 @@ class StudentAnswerSerializer(serializers.ModelSerializer):
                 {"selected_options": "This question allows only one option."}
             )
         key = getattr(question, "answer_key", None)
-        is_correct, marks = grade_answer(question, normalized, key)
+        is_correct = grade_answer(normalized, key)
         instance.selected_options = normalized
         instance.is_correct = is_correct
-        instance.marks_awarded = marks
+        instance.marks_awarded = 0
         instance.is_overridden = True
         instance.save(
             update_fields=(

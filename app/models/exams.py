@@ -6,6 +6,7 @@ from django.db import models
 from simple_history.models import HistoricalRecords
 
 from autograde.mixins.models import TimeStampMixin
+from filesystem.models.models import ImageModel
 
 
 class Exam(TimeStampMixin):
@@ -29,9 +30,6 @@ class Exam(TimeStampMixin):
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
     )
-    question_image = models.ImageField(
-        upload_to="questions/%Y/%m/%d", blank=True, null=True
-    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="exams"
     )
@@ -48,33 +46,19 @@ class Exam(TimeStampMixin):
 
 
 class Question(models.Model):
-    class Type(models.TextChoices):
-        MCQ = "MCQ", "MCQ"
-        CQ = "CQ", "CQ"
-
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="questions")
-    number = models.PositiveIntegerField()
-    type = models.CharField(max_length=3, choices=Type.choices, default=Type.MCQ)
-    marks = models.DecimalField(
-        max_digits=6,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal("0.01"))],
+    question_images = models.ManyToManyField(
+        ImageModel,
+        related_name="question_images",
+        blank=True,
     )
     options_count = models.PositiveSmallIntegerField(
         default=4, validators=[MinValueValidator(2), MaxValueValidator(10)]
     )
     allow_multiple = models.BooleanField(default=False)
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=("exam", "number"), name="unique_question_number_per_exam"
-            )
-        ]
-        ordering = ("number",)
-
     def __str__(self):
-        return f"{self.exam.title} - Question {self.number}"
+        return f"{self.exam.title} - Question {self.pk}"
 
 
 class AnswerKey(models.Model):
