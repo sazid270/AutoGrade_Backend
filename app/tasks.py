@@ -97,5 +97,8 @@ def process_batch_task(batch_id: int) -> list[str]:
 
 
 @shared_task(acks_late=True, reject_on_worker_lost=True)
-def regrade_exam_task(exam_id: int) -> int:
-    return regrade_exam(exam_id)
+def regrade_exam_task(
+    exam_id: int,
+    question_ids: list[int] | None = None,
+) -> int:
+    return regrade_exam(exam_id, question_ids)

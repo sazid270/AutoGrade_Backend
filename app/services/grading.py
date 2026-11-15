@@ -1,5 +1,4 @@
 from django.db import IntegrityError, transaction
-from django.db.models import Prefetch
 from django.utils import timezone
 
 from app.models.exams import AnswerKey, Exam
@@ -32,9 +31,9 @@ def validate_exam_template(exam: Exam) -> None:
     expected_questions = {question.pk for question in questions}
     if not expected_questions:
         raise ValueError("Add at least one MCQ question before scanning sheets.")
-    if any(not question.question_images.exists() for question in questions):
+    if not any(question.question_images.exists() for question in questions):
         raise ValueError(
-            "Upload at least one image for every MCQ question before scanning sheets."
+            "Upload at least one question-paper image before scanning sheets."
         )
     template_questions = {
         int(item["question_id"])
@@ -78,20 +77,27 @@ def _update_result(result: Result) -> None:
     )
 
 
-def regrade_sheet(sheet: AnswerSheet) -> None:
-    answers = (
-        sheet.answers.select_for_update()
-        .select_related("question")
-        .prefetch_related(Prefetch("question__answer_key"))
-    )
+def regrade_sheet(
+    sheet: AnswerSheet,
+    question_ids: set[int] | None = None,
+) -> bool:
+    answers = sheet.answers.select_for_update().select_related("question__answer_key")
+    if question_ids is not None:
+        answers = answers.filter(question_id__in=question_ids)
+    changed = False
     for answer in answers:
         if answer.is_overridden:
             continue
-        answer.is_correct = grade_answer(
+        is_correct = grade_answer(
             answer.selected_options, getattr(answer.question, "answer_key", None)
         )
+        if answer.is_correct == is_correct and answer.marks_awarded == 0:
+            continue
+        answer.is_correct = is_correct
         answer.marks_awarded = 0
         answer.save(update_fields=("is_correct", "marks_awarded"))
+        changed = True
+    return changed
 
 
 def process_sheet(sheet_id: int) -> AnswerSheet:
@@ -286,10 +292,13 @@ def regrade_result(result_id: int) -> Result:
         if answer.is_overridden:
             continue
         key = getattr(answer.question, "answer_key", None)
-        answer.is_correct = grade_answer(
+        is_correct = grade_answer(
             answer.selected_options,
             key,
         )
+        if answer.is_correct == is_correct and answer.marks_awarded == 0:
+            continue
+        answer.is_correct = is_correct
         answer.marks_awarded = 0
         answer.save(update_fields=("is_correct", "marks_awarded"))
     result.sheet = sheet
@@ -297,10 +306,15 @@ def regrade_result(result_id: int) -> Result:
     return result
 
 
-def regrade_exam(exam_id: int) -> int:
-    sheet_ids = AnswerSheet.objects.filter(batch__exam_id=exam_id).values_list(
-        "pk", flat=True
-    )
+def regrade_exam(exam_id: int, question_ids: list[int] | None = None) -> int:
+    if question_ids is not None and not question_ids:
+        return 0
+    question_id_filter = set(question_ids) if question_ids is not None else None
+    sheets = AnswerSheet.objects.filter(batch__exam_id=exam_id)
+    if question_id_filter is not None:
+        sheets = sheets.filter(answers__question_id__in=question_id_filter).distinct()
+    sheet_ids = sheets.values_list("pk", flat=True)
+    processed_count = 0
     for sheet_id in sheet_ids.iterator():
         with transaction.atomic():
             sheet = (
@@ -308,12 +322,20 @@ def regrade_exam(exam_id: int) -> int:
                 .select_related("batch__exam")
                 .get(pk=sheet_id)
             )
-            regrade_sheet(sheet)
+            answers_changed = regrade_sheet(
+                sheet,
+                question_ids=question_id_filter,
+            )
             result = sheet.result.filter(finalized=False).first()
-            if result and not result.is_overridden:
+            if (
+                result
+                and not result.is_overridden
+                and (question_id_filter is None or answers_changed)
+            ):
                 result.sheet = sheet
                 _update_result(result)
-    return len(sheet_ids)
+        processed_count += 1
+    return processed_count
 
 
 @transaction.atomic

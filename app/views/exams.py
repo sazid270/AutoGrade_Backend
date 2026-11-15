@@ -11,15 +11,18 @@ from app.models.exams import AnswerKey, Exam, Question
 from app.serializers.exams import (
     AnswerExtractionResponseSerializer,
     AnswerImageExtractionRequestSerializer,
+    AnswerKeyPatchSerializer,
     ExamAnswerSetSerializer,
     ExamAnswersResponseSerializer,
     ExamSerializer,
     QuestionSerializer,
+    SavedAnswerEntrySerializer,
 )
 from app.services.answer_extraction import (
     AnswerExtractionError,
     extract_answers_from_image,
 )
+from app.services.answer_keys import ensure_exam_questions
 
 
 class ExamView(viewsets.ModelViewSet):
@@ -44,6 +47,8 @@ class ExamView(viewsets.ModelViewSet):
             return ExamAnswerSetSerializer
         if self.action == "extract_answers":
             return AnswerImageExtractionRequestSerializer
+        if self.action == "answer_detail":
+            return AnswerKeyPatchSerializer
         return super().get_serializer_class()
 
     def get_queryset(self):
@@ -61,6 +66,7 @@ class ExamView(viewsets.ModelViewSet):
             self.check_object_permissions(request, exam)
             if (
                 exam.questions.exists()
+                or exam.answer_keys.exists()
                 or exam.batches.exists()
                 or exam.results.exists()
             ):
@@ -102,7 +108,7 @@ class ExamView(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=("get", "post"), url_path="answers")
     def answers(self, request, **kwargs):
-        """List or replace the full set of teacher-provided MCQ answers."""
+        """List or upsert supplied MCQ answers without deleting omitted entries."""
         exam = self._get_exam_for_action(request, kwargs)
         if exam.exam_type != Exam.Type.MCQ:
             return Response(
@@ -121,6 +127,38 @@ class ExamView(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(self._answers_data(exam))
+
+    @swagger_auto_schema(
+        method="patch",
+        request_body=AnswerKeyPatchSerializer,
+        responses={200: SavedAnswerEntrySerializer},
+    )
+    @action(
+        detail=True,
+        methods=("patch",),
+        url_path=r"answers/(?P<question_number>\d+)",
+    )
+    def answer_detail(self, request, question_number, **kwargs):
+        exam = self._get_exam_for_action(request, kwargs)
+        if exam.exam_type != Exam.Type.MCQ:
+            return Response(
+                {
+                    "detail": "Teacher answers are currently supported for MCQ exams only."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        answer_key = get_object_or_404(
+            AnswerKey.objects.filter(exam=exam),
+            question_number=question_number,
+        )
+        serializer = self.get_serializer(
+            answer_key,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        answer_key = serializer.save()
+        return Response(SavedAnswerEntrySerializer(answer_key).data)
 
     @swagger_auto_schema(
         method="post",
@@ -172,12 +210,9 @@ class ExamView(viewsets.ModelViewSet):
                 )
                 continue
             normalized_options = sorted({option.strip().upper() for option in options})
-            if (
-                not normalized_options
-                or not all(
-                    len(option) == 1 and "A" <= option <= "J"
-                    for option in normalized_options
-                )
+            if not normalized_options or not all(
+                len(option) == 1 and "A" <= option <= "J"
+                for option in normalized_options
             ):
                 invalid_answers.append(
                     {
@@ -191,14 +226,62 @@ class ExamView(viewsets.ModelViewSet):
                 {"question_number": number, "correct_options": normalized_options}
             )
 
+        saved_answers = []
+        with transaction.atomic():
+            exam = Exam.objects.select_for_update().get(pk=exam.pk)
+            questions = ensure_exam_questions(
+                exam,
+                {
+                    answer["question_number"]: answer["correct_options"]
+                    for answer in answers
+                },
+            )
+            for answer in sorted(answers, key=lambda item: item["question_number"]):
+                number = answer["question_number"]
+                question = questions[number - 1]
+                answer_key = (
+                    AnswerKey.objects.select_for_update()
+                    .filter(exam=exam, question_number=number)
+                    .first()
+                )
+                if answer_key is not None:
+                    answer_key.question = question
+                    answer_key.correct_options = answer["correct_options"]
+                    answer_key.source = AnswerKey.Source.SCANNED
+                    answer_key.confidence = None
+                    answer_key.needs_review = True
+                    answer_key.updated_by = request.user
+                    answer_key.save(
+                        update_fields=(
+                            "question",
+                            "correct_options",
+                            "source",
+                            "confidence",
+                            "needs_review",
+                            "updated_by",
+                            "updated_at",
+                        )
+                    )
+                else:
+                    answer_key = AnswerKey.objects.create(
+                        exam=exam,
+                        question_number=number,
+                        question=question,
+                        correct_options=answer["correct_options"],
+                        source=AnswerKey.Source.SCANNED,
+                        needs_review=True,
+                        updated_by=request.user,
+                    )
+                saved_answers.append(answer_key)
+
         return Response(
             {
                 "exam": exam.pk,
                 "source": "image",
-                "requires_review": True,
-                "answers": sorted(
-                    answers, key=lambda answer: answer["question_number"]
-                ),
+                "requires_review": bool(invalid_answers)
+                or any(answer.needs_review for answer in saved_answers),
+                "answers": SavedAnswerEntrySerializer(saved_answers, many=True).data,
+                "conflicts": [],
                 "invalid_answers": invalid_answers,
             }
         )
@@ -213,55 +296,47 @@ class ExamView(viewsets.ModelViewSet):
 
     @staticmethod
     def _answers_data(exam):
-        questions = list(exam.questions.order_by("pk"))
-        keys = {
-            key.question_id: key
-            for key in AnswerKey.objects.filter(question__exam=exam).select_related(
-                "question"
-            )
-        }
+        keys = AnswerKey.objects.filter(exam=exam).order_by("question_number")
         return {
             "exam": exam.pk,
-            "answers": [
-                {
-                    "question_number": number,
-                    "correct_options": keys[question.pk].correct_options
-                    if question.pk in keys
-                    else [],
-                    "source": keys[question.pk].source
-                    if question.pk in keys
-                    else None,
-                    "needs_review": keys[question.pk].needs_review
-                    if question.pk in keys
-                    else False,
-                }
-                for number, question in enumerate(questions, start=1)
-            ],
+            "answers": SavedAnswerEntrySerializer(keys, many=True).data,
         }
 
     @staticmethod
     def _answer_key_preview_data(exam):
         from app.services.grading import validate_exam_template
 
+        exam_questions = list(
+            exam.questions.prefetch_related("question_images").order_by("pk")
+        )
+        questions_by_number = {
+            number: question for number, question in enumerate(exam_questions, start=1)
+        }
+        keys_by_number = {
+            answer_key.question_number: answer_key
+            for answer_key in AnswerKey.objects.filter(exam=exam)
+        }
+        question_numbers = sorted(set(questions_by_number) | set(keys_by_number))
         questions = []
-        for number, question in enumerate(
-            exam.questions.prefetch_related("answer_key").order_by("pk"),
-            start=1,
-        ):
-            answer_key = getattr(question, "answer_key", None)
+        for number in question_numbers:
+            question = questions_by_number.get(number)
+            answer_key = keys_by_number.get(number)
             question_data = {
-                "id": question.pk,
+                "id": question.pk if question else None,
+                "answer_key_id": answer_key.pk if answer_key else None,
                 "question_number": number,
                 "question_images": [
                     image.image.url
                     for image in question.question_images.all()
                     if image.image
-                ],
+                ]
+                if question
+                else [],
                 "correct_options": answer_key.correct_options if answer_key else [],
                 "source": answer_key.source if answer_key else None,
                 "needs_review": answer_key.needs_review if answer_key else False,
             }
-            if exam.exam_type == Exam.Type.MCQ:
+            if exam.exam_type == Exam.Type.MCQ and question:
                 question_data["options_count"] = question.options_count
                 question_data["allow_multiple"] = question.allow_multiple
             questions.append(question_data)

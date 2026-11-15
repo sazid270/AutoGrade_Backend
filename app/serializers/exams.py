@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 from app.models.exams import AnswerKey, Exam, Question
 from app.models.scanning import ExamScanConfiguration
+from app.services.answer_keys import ensure_exam_questions
 from app.tasks import regrade_exam_task
 from filesystem.models.models import ImageModel
 
@@ -315,7 +316,7 @@ class QuestionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Questions cannot be added after scanning begins."
             )
-        if AnswerKey.objects.filter(question__exam=exam).exists():
+        if AnswerKey.objects.filter(exam=exam).exists():
             raise serializers.ValidationError(
                 "Questions cannot be added after answers have been entered."
             )
@@ -343,7 +344,7 @@ class QuestionSerializer(serializers.ModelSerializer):
 class AnswerEntrySerializer(serializers.Serializer):
     question_number = serializers.IntegerField(
         min_value=1,
-        help_text="The sequential number assigned to the Question.",
+        help_text="The question number printed in the answer key.",
     )
     correct_options = serializers.ListField(
         child=serializers.CharField(min_length=1, max_length=1),
@@ -367,57 +368,55 @@ class ExamAnswerSetSerializer(serializers.Serializer):
                 "Teacher answers are currently supported for MCQ exams only."
             )
 
-        questions = list(exam.questions.order_by("pk"))
-        if not questions:
-            raise serializers.ValidationError(
-                {"answers": "Scan the question-paper images before entering answers."}
-            )
-
         received_numbers = [item["question_number"] for item in attrs["answers"]]
         if len(received_numbers) != len(set(received_numbers)):
             raise serializers.ValidationError(
                 {"answers": "Each question_number can appear only once."}
             )
-        question_numbers = set(range(1, len(questions) + 1))
-        missing_numbers = sorted(question_numbers - set(received_numbers))
-        unknown_numbers = sorted(set(received_numbers) - question_numbers)
-        if missing_numbers or unknown_numbers:
-            raise serializers.ValidationError(
-                {
-                    "answers": {
-                        "missing_question_numbers": missing_numbers,
-                        "unknown_question_numbers": unknown_numbers,
-                    }
-                }
-            )
 
+        questions = list(exam.questions.order_by("pk"))
         normalized_answers = []
         for item in attrs["answers"]:
-            question = questions[item["question_number"] - 1]
+            question_number = item["question_number"]
+            question = (
+                questions[question_number - 1]
+                if question_number <= len(questions)
+                else None
+            )
             options = sorted(
                 {option.strip().upper() for option in item["correct_options"]}
             )
-            allowed_options = {
-                chr(ord("A") + index) for index in range(question.options_count)
-            }
-            if not set(options).issubset(allowed_options):
+            if not set(options).issubset(set("ABCDEFGHIJ")):
                 raise serializers.ValidationError(
                     {
                         "answers": (
-                            f"Question {item['question_number']} has an option outside its "
+                            f"Question {question_number} has an option outside A through J."
+                        )
+                    }
+                )
+            if question is not None and not set(options).issubset(
+                {
+                    chr(ord("A") + index)
+                    for index in range(question.options_count)
+                }
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "answers": (
+                            f"Question {question_number} has an option outside its "
                             "configured options_count."
                         )
                     }
                 )
-            if not question.allow_multiple and len(options) > 1:
+            if question is not None and not question.allow_multiple and len(options) > 1:
                 raise serializers.ValidationError(
                     {
                         "answers": (
-                            f"Question {item['question_number']} allows only one correct option."
+                            f"Question {question_number} allows only one correct option."
                         )
                     }
                 )
-            normalized_answers.append((question, options))
+            normalized_answers.append((question_number, options))
 
         attrs["normalized_answers"] = normalized_answers
         return attrs
@@ -429,25 +428,38 @@ class ExamAnswerSetSerializer(serializers.Serializer):
         model_source = (
             AnswerKey.Source.SCANNED if source == "image" else AnswerKey.Source.MANUAL
         )
-        updated = False
+        questions = ensure_exam_questions(
+            exam,
+            dict(validated_data["normalized_answers"]),
+        )
+        question_ids_to_regrade = set()
         entries = []
-        for question, options in validated_data["normalized_answers"]:
+        for question_number, options in validated_data["normalized_answers"]:
+            question = questions[question_number - 1]
             key, created = AnswerKey.objects.select_for_update().get_or_create(
-                question=question,
+                exam=exam,
+                question_number=question_number,
                 defaults={
+                    "question": question,
                     "correct_options": options,
                     "source": model_source,
                     "needs_review": False,
                     "updated_by": self.context["request"].user,
                 },
             )
-            if not created:
+            if created:
+                question_ids_to_regrade.add(question.pk)
+            else:
+                previous_question_id = key.question_id
+                options_changed = sorted(key.correct_options) != options
                 changed = (
-                    sorted(key.correct_options) != options
+                    options_changed
                     or key.needs_review
                     or key.source != model_source
+                    or key.question_id != question.pk
                 )
                 if changed:
+                    key.question = question
                     key.correct_options = options
                     key.source = (
                         AnswerKey.Source.MANUAL_EDIT
@@ -458,6 +470,7 @@ class ExamAnswerSetSerializer(serializers.Serializer):
                     key.updated_by = self.context["request"].user
                     key.save(
                         update_fields=(
+                            "question",
                             "correct_options",
                             "source",
                             "needs_review",
@@ -465,12 +478,18 @@ class ExamAnswerSetSerializer(serializers.Serializer):
                             "updated_at",
                         )
                     )
-                    updated = True
-            updated = updated or created
+                    if options_changed or previous_question_id != question.pk:
+                        question_ids_to_regrade.add(previous_question_id)
+                        question_ids_to_regrade.add(question.pk)
             entries.append(key)
 
-        if updated:
-            transaction.on_commit(lambda: regrade_exam_task.delay(exam.pk))
+        if question_ids_to_regrade:
+            question_ids = sorted(question_ids_to_regrade)
+            transaction.on_commit(
+                lambda exam_id=exam.pk, ids=question_ids: regrade_exam_task.delay(
+                    exam_id, ids
+                )
+            )
         return entries
 
 
@@ -492,10 +511,69 @@ class AnswerImageExtractionRequestSerializer(serializers.Serializer):
 
 
 class SavedAnswerEntrySerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    exam = serializers.IntegerField(source="exam_id")
+    question = serializers.IntegerField(source="question_id")
     question_number = serializers.IntegerField()
     correct_options = serializers.ListField(child=serializers.CharField())
     source = serializers.ChoiceField(choices=AnswerKey.Source.choices, allow_null=True)
     needs_review = serializers.BooleanField()
+
+
+class AnswerConflictSerializer(serializers.Serializer):
+    question_number = serializers.IntegerField()
+    existing_options = serializers.ListField(child=serializers.CharField())
+    extracted_options = serializers.ListField(child=serializers.CharField())
+
+
+class AnswerKeyPatchSerializer(serializers.Serializer):
+    correct_options = serializers.ListField(
+        child=serializers.CharField(min_length=1, max_length=1),
+        allow_empty=False,
+    )
+
+    def validate_correct_options(self, value):
+        options = sorted({option.strip().upper() for option in value})
+        if not set(options).issubset(set("ABCDEFGHIJ")):
+            raise serializers.ValidationError("Options must be letters A through J.")
+
+        answer_key = self.instance
+        if answer_key.question_id:
+            question = answer_key.question
+            allowed_options = {
+                chr(ord("A") + index) for index in range(question.options_count)
+            }
+            if not set(options).issubset(allowed_options):
+                raise serializers.ValidationError(
+                    "An option is outside this question's configured options_count."
+                )
+            if not question.allow_multiple and len(options) > 1:
+                raise serializers.ValidationError(
+                    "This question allows only one correct option."
+                )
+        return options
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        instance.correct_options = validated_data["correct_options"]
+        instance.source = AnswerKey.Source.MANUAL_EDIT
+        instance.needs_review = False
+        instance.updated_by = self.context["request"].user
+        instance.save(
+            update_fields=(
+                "correct_options",
+                "source",
+                "needs_review",
+                "updated_by",
+                "updated_at",
+            )
+        )
+        exam_id = instance.exam_id
+        question_ids = [instance.question_id]
+        transaction.on_commit(
+            lambda: regrade_exam_task.delay(exam_id, question_ids)
+        )
+        return instance
 
 
 class ExamAnswersResponseSerializer(serializers.Serializer):
@@ -507,21 +585,6 @@ class AnswerExtractionResponseSerializer(serializers.Serializer):
     exam = serializers.IntegerField()
     source = serializers.ChoiceField(choices=("image",))
     requires_review = serializers.BooleanField()
-    answers = AnswerEntrySerializer(many=True)
+    answers = SavedAnswerEntrySerializer(many=True)
+    conflicts = AnswerConflictSerializer(many=True)
     invalid_answers = serializers.ListField(child=serializers.JSONField())
-
-    def update(self, instance, validated_data):
-        options_changed = "correct_options" in validated_data and sorted(
-            validated_data["correct_options"]
-        ) != sorted(instance.correct_options)
-        if not instance.needs_review and not options_changed:
-            return instance
-        validated_data["source"] = AnswerKey.Source.MANUAL_EDIT
-        validated_data["needs_review"] = False
-        validated_data["updated_by"] = self.context["request"].user
-        with transaction.atomic():
-            instance = super().update(instance, validated_data)
-            transaction.on_commit(
-                lambda: regrade_exam_task.delay(instance.question.exam_id)
-            )
-        return instance

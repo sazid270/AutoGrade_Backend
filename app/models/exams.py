@@ -3,7 +3,6 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from simple_history.models import HistoricalRecords
 
 from autograde.mixins.models import TimeStampMixin
 from filesystem.models.models import ImageModel
@@ -77,8 +76,16 @@ class AnswerKey(models.Model):
         MANUAL_EDIT = "manual_edit", "Manual edit"
 
     question = models.OneToOneField(
-        Question, on_delete=models.CASCADE, related_name="answer_key"
+        Question,
+        on_delete=models.CASCADE,
+        related_name="answer_key",
     )
+    exam = models.ForeignKey(
+        Exam,
+        on_delete=models.CASCADE,
+        related_name="answer_keys",
+    )
+    question_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     correct_options = models.JSONField(default=list)
     source = models.CharField(max_length=16, choices=Source.choices)
     confidence = models.FloatField(blank=True, null=True)
@@ -91,7 +98,18 @@ class AnswerKey(models.Model):
         related_name="answer_key_edits",
     )
     updated_at = models.DateTimeField(auto_now=True)
-    history = HistoricalRecords()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("exam", "question_number"),
+                name="unique_answer_key_per_exam_question",
+            ),
+            models.CheckConstraint(
+                check=models.Q(question_number__gte=1),
+                name="answer_key_question_number_positive",
+            ),
+        ]
 
     def __str__(self):
-        return f"Answer key for {self.question}"
+        return f"Answer key for {self.exam} - Question {self.question_number}"
