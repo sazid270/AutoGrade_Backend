@@ -56,6 +56,12 @@ class ExamSerializer(serializers.ModelSerializer):
             "updated_at",
         )
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.exam_type != Exam.Type.MCQ:
+            data.pop("negative_marks", None)
+        return data
+
     @transaction.atomic
     def create(self, validated_data):
         exam = Exam.objects.create(
@@ -65,6 +71,29 @@ class ExamSerializer(serializers.ModelSerializer):
         return exam
 
     def validate(self, attrs):
+        exam_type = attrs.get(
+            "exam_type",
+            self.instance.exam_type
+            if self.instance is not None
+            else Exam.Type.MCQ,
+        )
+        if exam_type != Exam.Type.MCQ:
+            if "negative_marks" in attrs:
+                raise serializers.ValidationError(
+                    {"negative_marks": "This field is only valid for MCQ exams."}
+                )
+            if (
+                self.instance is not None
+                and "exam_type" in attrs
+                and self.instance.negative_marks != 0
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "negative_marks": (
+                            "Set this to 0 before changing the exam type to CQ."
+                        )
+                    }
+                )
         marks = attrs.get("marks")
         if marks is not None and marks <= 0:
             raise serializers.ValidationError({"marks": "Must be positive."})
@@ -123,7 +152,17 @@ class ExamSerializer(serializers.ModelSerializer):
                 )
         return attrs
 
+    @transaction.atomic
     def update(self, instance, validated_data):
+        instance = Exam.objects.select_for_update().get(pk=instance.pk)
+        if (
+            instance.questions.exists()
+            and "exam_type" in validated_data
+            and validated_data["exam_type"] != instance.exam_type
+        ):
+            raise serializers.ValidationError(
+                "Exam type cannot change after questions have been added."
+            )
         locked_fields = (
             "class_or_batch",
             "section",
@@ -131,6 +170,7 @@ class ExamSerializer(serializers.ModelSerializer):
             "exam_year",
             "exam_type",
             "marks",
+            "negative_marks",
         )
         if instance.batches.exists() and any(
             field in validated_data
@@ -141,7 +181,6 @@ class ExamSerializer(serializers.ModelSerializer):
                 "Exam identity fields cannot change after scanning begins."
             )
         return super().update(instance, validated_data)
-
 
 class QuestionSerializer(serializers.ModelSerializer):
     question_images = serializers.PrimaryKeyRelatedField(
@@ -231,29 +270,27 @@ class QuestionSerializer(serializers.ModelSerializer):
             for field in mcq_fields:
                 attrs.pop(field, None)
         if question is not None:
-            if question.exam.batches.exists() and any(
-                field in attrs
-                for field in (
-                    "question_images",
-                    "options_count",
-                    "allow_multiple",
+            image_changed = (
+                "question_images" in attrs
+                and sorted(image.pk for image in attrs["question_images"])
+                != sorted(question.question_images.values_list("pk", flat=True))
+            )
+            config_changed = any(
+                attrs[field] != getattr(question, field)
+                for field in ("options_count", "allow_multiple")
+                if field in attrs
+            )
+            if question.exam.batches.exists() and (image_changed or config_changed):
+                raise serializers.ValidationError(
+                    "Question fields cannot change after scanning begins."
                 )
-            ):
-                if any(
-                    (
-                        sorted(image.pk for image in attrs[field])
-                        != sorted(question.question_images.values_list("pk", flat=True))
-                        if field == "question_images"
-                        else attrs[field] != getattr(question, field)
-                    )
-                    for field in attrs
-                ):
-                    raise serializers.ValidationError(
-                        "Question fields cannot change after scanning begins."
-                    )
+            if image_changed and getattr(question, "answer_key", None):
+                raise serializers.ValidationError(
+                    "Question images cannot change after answers are entered."
+                )
         if question is not None:
             key = getattr(question, "answer_key", None)
-            if key:
+            if key and question.exam.exam_type == Exam.Type.MCQ:
                 options_count = attrs.get("options_count", question.options_count)
                 allow_multiple = attrs.get("allow_multiple", question.allow_multiple)
                 options = key.correct_options
@@ -270,86 +307,208 @@ class QuestionSerializer(serializers.ModelSerializer):
                     )
         return attrs
 
+    @transaction.atomic
     def create(self, validated_data):
-        exam = validated_data["exam"]
+        exam = Exam.objects.select_for_update().get(pk=validated_data["exam"].pk)
+        validated_data["exam"] = exam
         if exam.batches.exists():
             raise serializers.ValidationError(
                 "Questions cannot be added after scanning begins."
             )
+        if AnswerKey.objects.filter(question__exam=exam).exists():
+            raise serializers.ValidationError(
+                "Questions cannot be added after answers have been entered."
+            )
         return super().create(validated_data)
 
+    @transaction.atomic
     def update(self, instance, validated_data):
+        exam = Exam.objects.select_for_update().get(pk=instance.exam_id)
+        instance = Question.objects.select_for_update().get(pk=instance.pk, exam=exam)
+        new_images = validated_data.get("question_images")
+        images_changed = new_images is not None and {
+            image.pk for image in new_images
+        } != set(instance.question_images.values_list("pk", flat=True))
+        if images_changed and (
+            exam.batches.exists()
+            or AnswerKey.objects.filter(question=instance).exists()
+        ):
+            raise serializers.ValidationError(
+                "Question images cannot change after answers are entered "
+                "or scanning begins."
+            )
         return super().update(instance, validated_data)
 
 
-class AnswerKeySerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AnswerKey
-        fields = "__all__"
-        read_only_fields = (
-            "source",
-            "confidence",
-            "needs_review",
-            "updated_by",
-            "updated_at",
-        )
+class AnswerEntrySerializer(serializers.Serializer):
+    question_number = serializers.IntegerField(
+        min_value=1,
+        help_text="The sequential number assigned to the Question.",
+    )
+    correct_options = serializers.ListField(
+        child=serializers.CharField(min_length=1, max_length=1),
+        allow_empty=False,
+        help_text="Correct option letters, such as ['B'] or ['A', 'C'].",
+    )
 
-    def get_extra_kwargs(self):
-        extra_kwargs = super().get_extra_kwargs()
-        if self.instance is not None:
-            extra_kwargs["question"] = {"read_only": True}
-        return extra_kwargs
+
+class ExamAnswerSetSerializer(serializers.Serializer):
+    source = serializers.ChoiceField(
+        choices=("manual", "image"),
+        default="manual",
+        help_text="Use 'image' after reviewing an extracted image draft.",
+    )
+    answers = AnswerEntrySerializer(many=True, allow_empty=False)
 
     def validate(self, attrs):
-        question = attrs.get("question", getattr(self.instance, "question", None))
-        options = attrs.get(
-            "correct_options",
-            getattr(self.instance, "correct_options", []),
-        )
-        if question is None:
-            raise serializers.ValidationError({"question": "This field is required."})
-        if question.exam.created_by_id != self.context["request"].user.id:
+        exam = self.context["exam"]
+        if exam.exam_type != Exam.Type.MCQ:
             raise serializers.ValidationError(
-                {"question": "You cannot use another user's question."}
+                "Teacher answers are currently supported for MCQ exams only."
             )
-        if question.exam.exam_type != Exam.Type.MCQ:
+
+        questions = list(exam.questions.order_by("pk"))
+        if not questions:
             raise serializers.ValidationError(
-                {"question": "CQ questions cannot have an OMR answer key."}
+                {"answers": "Scan the question-paper images before entering answers."}
             )
-        if not options:
+
+        received_numbers = [item["question_number"] for item in attrs["answers"]]
+        if len(received_numbers) != len(set(received_numbers)):
             raise serializers.ValidationError(
-                {"correct_options": "At least one option is required."}
+                {"answers": "Each question_number can appear only once."}
             )
-        if not isinstance(options, list):
+        question_numbers = set(range(1, len(questions) + 1))
+        missing_numbers = sorted(question_numbers - set(received_numbers))
+        unknown_numbers = sorted(set(received_numbers) - question_numbers)
+        if missing_numbers or unknown_numbers:
             raise serializers.ValidationError(
-                {"correct_options": "Options must be a list."}
+                {
+                    "answers": {
+                        "missing_question_numbers": missing_numbers,
+                        "unknown_question_numbers": unknown_numbers,
+                    }
+                }
             )
-        if not all(isinstance(option, str) for option in options):
-            raise serializers.ValidationError(
-                {"correct_options": "Every option must be a string."}
+
+        normalized_answers = []
+        for item in attrs["answers"]:
+            question = questions[item["question_number"] - 1]
+            options = sorted(
+                {option.strip().upper() for option in item["correct_options"]}
             )
-        options = sorted({option.strip().upper() for option in options})
-        allowed = {chr(ord("A") + index) for index in range(question.options_count)}
-        if not all(option in allowed for option in options):
-            raise serializers.ValidationError(
-                {"correct_options": "Options must be letters within options_count."}
-            )
-        if not question.allow_multiple and len(options) > 1:
-            raise serializers.ValidationError(
-                {"correct_options": "This question allows only one option."}
-            )
-        attrs["correct_options"] = options
+            allowed_options = {
+                chr(ord("A") + index) for index in range(question.options_count)
+            }
+            if not set(options).issubset(allowed_options):
+                raise serializers.ValidationError(
+                    {
+                        "answers": (
+                            f"Question {item['question_number']} has an option outside its "
+                            "configured options_count."
+                        )
+                    }
+                )
+            if not question.allow_multiple and len(options) > 1:
+                raise serializers.ValidationError(
+                    {
+                        "answers": (
+                            f"Question {item['question_number']} allows only one correct option."
+                        )
+                    }
+                )
+            normalized_answers.append((question, options))
+
+        attrs["normalized_answers"] = normalized_answers
         return attrs
 
+    @transaction.atomic
     def create(self, validated_data):
-        validated_data["source"] = AnswerKey.Source.MANUAL
-        validated_data["updated_by"] = self.context["request"].user
-        with transaction.atomic():
-            instance = super().create(validated_data)
-            transaction.on_commit(
-                lambda: regrade_exam_task.delay(instance.question.exam_id)
+        exam = Exam.objects.select_for_update().get(pk=self.context["exam"].pk)
+        source = validated_data["source"]
+        model_source = (
+            AnswerKey.Source.SCANNED if source == "image" else AnswerKey.Source.MANUAL
+        )
+        updated = False
+        entries = []
+        for question, options in validated_data["normalized_answers"]:
+            key, created = AnswerKey.objects.select_for_update().get_or_create(
+                question=question,
+                defaults={
+                    "correct_options": options,
+                    "source": model_source,
+                    "needs_review": False,
+                    "updated_by": self.context["request"].user,
+                },
             )
-        return instance
+            if not created:
+                changed = (
+                    sorted(key.correct_options) != options
+                    or key.needs_review
+                    or key.source != model_source
+                )
+                if changed:
+                    key.correct_options = options
+                    key.source = (
+                        AnswerKey.Source.MANUAL_EDIT
+                        if source == "manual"
+                        else model_source
+                    )
+                    key.needs_review = False
+                    key.updated_by = self.context["request"].user
+                    key.save(
+                        update_fields=(
+                            "correct_options",
+                            "source",
+                            "needs_review",
+                            "updated_by",
+                            "updated_at",
+                        )
+                    )
+                    updated = True
+            updated = updated or created
+            entries.append(key)
+
+        if updated:
+            transaction.on_commit(lambda: regrade_exam_task.delay(exam.pk))
+        return entries
+
+
+class AnswerImageExtractionRequestSerializer(serializers.Serializer):
+    image_id = serializers.PrimaryKeyRelatedField(
+        queryset=ImageModel.objects.all(),
+        help_text=(
+            "Image ID returned. The image is sent to the "
+            "configured extraction service for processing."
+        ),
+    )
+
+    def validate_image_id(self, value):
+        if value.created_by_id != self.context["request"].user.id:
+            raise serializers.ValidationError(
+                "You can only process an image that you uploaded."
+            )
+        return value
+
+
+class SavedAnswerEntrySerializer(serializers.Serializer):
+    question_number = serializers.IntegerField()
+    correct_options = serializers.ListField(child=serializers.CharField())
+    source = serializers.ChoiceField(choices=AnswerKey.Source.choices, allow_null=True)
+    needs_review = serializers.BooleanField()
+
+
+class ExamAnswersResponseSerializer(serializers.Serializer):
+    exam = serializers.IntegerField()
+    answers = SavedAnswerEntrySerializer(many=True)
+
+
+class AnswerExtractionResponseSerializer(serializers.Serializer):
+    exam = serializers.IntegerField()
+    source = serializers.ChoiceField(choices=("image",))
+    requires_review = serializers.BooleanField()
+    answers = AnswerEntrySerializer(many=True)
+    invalid_answers = serializers.ListField(child=serializers.JSONField())
 
     def update(self, instance, validated_data):
         options_changed = "correct_options" in validated_data and sorted(

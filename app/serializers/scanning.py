@@ -25,7 +25,6 @@ class ExamScanConfigurationSerializer(serializers.ModelSerializer):
         fields = (
             "exam",
             "omr_template",
-            "answer_key_image",
             "created_at",
             "updated_at",
         )

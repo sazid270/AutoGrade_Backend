@@ -30,6 +30,11 @@ class Exam(TimeStampMixin):
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
     )
+    negative_marks = models.FloatField(
+        default=0.0,
+        validators=[MinValueValidator(0)],
+        help_text="Marks deducted for each incorrect MCQ answer.",
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="exams"
     )
@@ -38,7 +43,11 @@ class Exam(TimeStampMixin):
         constraints = [
             models.UniqueConstraint(
                 fields=("created_by", "title"), name="unique_exam_title_per_teacher"
-            )
+            ),
+            models.CheckConstraint(
+                check=models.Q(exam_type="mcq") | models.Q(negative_marks=0),
+                name="negative_marks_only_for_mcq",
+            ),
         ]
 
     def __str__(self):
@@ -58,7 +67,7 @@ class Question(models.Model):
     allow_multiple = models.BooleanField(default=False)
 
     def __str__(self):
-        return f"{self.exam.title} - Question {self.pk}"
+        return f"{self.exam.title} - Question sheet {self.pk}"
 
 
 class AnswerKey(models.Model):

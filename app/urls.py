@@ -1,7 +1,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from app.views.exams import AnswerKeyView, ExamView, QuestionView
+from app.views.exams import ExamView, QuestionView
 from app.views.results import ResultView
 from app.views.scanning import (
     AnswerSheetView,
@@ -19,7 +19,6 @@ router.register("students", StudentView, basename="student")
 # Exam url routes
 router.register("exams", ExamView, basename="exam")
 router.register("questions", QuestionView, basename="question")
-router.register("answer-keys", AnswerKeyView, basename="answer-key")
 
 # Result url routes
 router.register("results", ResultView, basename="result")

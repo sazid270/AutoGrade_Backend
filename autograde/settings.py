@@ -212,6 +212,15 @@ OTP_MAX_ATTEMPTS = env("OTP_MAX_ATTEMPTS", cast=int, default=5)
 OTP_RESEND_COOLDOWN_TIME = env("OTP_RESEND_COOLDOWN_TIME", cast=int, default=1)
 GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", default="")
 
+# OpenRouter settings
+OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", default="")
+OPENROUTER_BASE_URL = env(
+    "OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1"
+)
+OPENROUTER_ANSWER_MODEL = env(
+    "OPENROUTER_ANSWER_MODEL", default="openrouter/free"
+)
+
 REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
     "otp_request": "10/hour",
     "otp_verify": "30/hour",
