@@ -386,7 +386,7 @@ class StudentAnswerSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"selected_options": "This question allows only one option."}
             )
-        key = getattr(question, "answer_key", None)
+        key = getattr(question, "answer", None)
         is_correct = grade_answer(normalized, key)
         instance.selected_options = normalized
         instance.is_correct = is_correct

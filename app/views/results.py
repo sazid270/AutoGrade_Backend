@@ -7,6 +7,7 @@ from app.models.results import Result
 from app.serializers.results import ResultSerializer
 
 
+# Result views
 class ResultView(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,

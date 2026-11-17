@@ -8,6 +8,7 @@ from autograde.mixins.models import TimeStampMixin
 from filesystem.models.models import ImageModel
 
 
+# Exam models
 class Exam(TimeStampMixin):
     class Type(models.TextChoices):
         MCQ = "mcq", "MCQ"
@@ -53,6 +54,7 @@ class Exam(TimeStampMixin):
         return self.title
 
 
+# Question models
 class Question(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="questions")
     question_images = models.ManyToManyField(
@@ -69,7 +71,8 @@ class Question(models.Model):
         return f"{self.exam.title} - Question sheet {self.pk}"
 
 
-class AnswerKey(models.Model):
+# Answer models
+class Answer(models.Model):
     class Source(models.TextChoices):
         MANUAL = "manual", "Manual"
         SCANNED = "scanned", "Scanned"
@@ -78,12 +81,12 @@ class AnswerKey(models.Model):
     question = models.OneToOneField(
         Question,
         on_delete=models.CASCADE,
-        related_name="answer_key",
+        related_name="answer",
     )
     exam = models.ForeignKey(
         Exam,
         on_delete=models.CASCADE,
-        related_name="answer_keys",
+        related_name="answers",
     )
     question_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     correct_options = models.JSONField(default=list)
@@ -95,7 +98,7 @@ class AnswerKey(models.Model):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="answer_key_edits",
+        related_name="answer_edits",
     )
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -103,13 +106,13 @@ class AnswerKey(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=("exam", "question_number"),
-                name="unique_answer_key_per_exam_question",
+                name="unique_answer_per_exam_question",
             ),
             models.CheckConstraint(
                 check=models.Q(question_number__gte=1),
-                name="answer_key_question_number_positive",
+                name="answer_question_number_positive",
             ),
         ]
 
     def __str__(self):
-        return f"Answer key for {self.exam} - Question {self.question_number}"
+        return f"Answer for {self.exam} - Question {self.question_number}"

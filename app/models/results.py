@@ -10,6 +10,7 @@ from app.models.students import Student
 from autograde.mixins.models import TimeStampMixin
 
 
+# Result models
 class Result(TimeStampMixin):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="results")
     student = models.ForeignKey(

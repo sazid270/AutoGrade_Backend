@@ -7,6 +7,7 @@ from app.models.students import Student
 from app.serializers.students import StudentSerializer
 
 
+# Student views
 class StudentView(viewsets.ModelViewSet):
     serializer_class = StudentSerializer
     http_method_names = ["get", "post", "patch", "delete"]

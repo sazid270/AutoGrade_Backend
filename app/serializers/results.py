@@ -5,6 +5,7 @@ from rest_framework import serializers
 from app.models.results import Result
 
 
+# Result serializers
 class ResultSerializer(serializers.ModelSerializer):
     class Meta:
         model = Result
@@ -54,10 +55,9 @@ class ResultSerializer(serializers.ModelSerializer):
             mcq_marks = attrs.get(
                 "mcq_marks", getattr(self.instance, "mcq_marks", Decimal("0"))
             )
-            cq_marks = (
-                attrs.get("cq_marks", getattr(self.instance, "cq_marks", Decimal("0")))
-                or Decimal("0")
-            )
+            cq_marks = attrs.get(
+                "cq_marks", getattr(self.instance, "cq_marks", Decimal("0"))
+            ) or Decimal("0")
             if mcq_marks < 0 or cq_marks < 0:
                 raise serializers.ValidationError("Marks cannot be negative.")
             if exam.exam_type == exam.Type.MCQ and cq_marks:

@@ -1,7 +1,7 @@
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from app.models.exams import AnswerKey, Exam
+from app.models.exams import Answer, Exam
 from app.models.results import Result
 from app.models.scanning import AnswerSheet, ExamScanConfiguration, StudentAnswer
 from app.models.students import Student
@@ -11,12 +11,12 @@ from app.utils.student_keys import normalize_roll_no, normalize_student_key
 
 def grade_answer(
     selected_options: list[str],
-    answer_key: AnswerKey | None,
+    answer: Answer | None,
 ) -> bool | None:
-    if answer_key is None:
+    if answer is None:
         return None
     selected = sorted({str(option).strip().upper() for option in selected_options})
-    return selected == sorted(answer_key.correct_options)
+    return selected == sorted(answer.correct_options)
 
 
 def validate_exam_template(exam: Exam) -> None:
@@ -65,9 +65,9 @@ def validate_exam_template(exam: Exam) -> None:
             raise ValueError("OMR bubble count does not match question options.")
         if bool(item.get("allow_multiple", False)) != question.allow_multiple:
             raise ValueError("OMR multiple-selection setting does not match question.")
-        if not hasattr(question, "answer_key"):
+        if not hasattr(question, "answer"):
             raise ValueError("Every MCQ must have an answer key before scanning.")
-        if question.answer_key.needs_review:
+        if question.answer.needs_review:
             raise ValueError("Review every flagged answer key before scanning.")
 
 
@@ -81,7 +81,7 @@ def regrade_sheet(
     sheet: AnswerSheet,
     question_ids: set[int] | None = None,
 ) -> bool:
-    answers = sheet.answers.select_for_update().select_related("question__answer_key")
+    answers = sheet.answers.select_for_update().select_related("question__answer")
     if question_ids is not None:
         answers = answers.filter(question_id__in=question_ids)
     changed = False
@@ -89,7 +89,7 @@ def regrade_sheet(
         if answer.is_overridden:
             continue
         is_correct = grade_answer(
-            answer.selected_options, getattr(answer.question, "answer_key", None)
+            answer.selected_options, getattr(answer.question, "answer", None)
         )
         if answer.is_correct == is_correct and answer.marks_awarded == 0:
             continue
@@ -241,11 +241,11 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
 
         questions = {
             question.pk: question
-            for question in exam.questions.select_related("answer_key").all()
+            for question in exam.questions.select_related("answer").all()
         }
         for question_id, answer_data in data["answers"].items():
             question = questions[int(question_id)]
-            key = getattr(question, "answer_key", None)
+            key = getattr(question, "answer", None)
             existing = StudentAnswer.objects.filter(
                 sheet=sheet, question=question
             ).first()
@@ -288,10 +288,10 @@ def regrade_result(result_id: int) -> Result:
     if result.finalized or result.is_overridden or not result.sheet_id:
         return result
     sheet = AnswerSheet.objects.select_for_update().get(pk=result.sheet_id)
-    for answer in sheet.answers.select_related("question__answer_key").all():
+    for answer in sheet.answers.select_related("question__answer").all():
         if answer.is_overridden:
             continue
-        key = getattr(answer.question, "answer_key", None)
+        key = getattr(answer.question, "answer", None)
         is_correct = grade_answer(
             answer.selected_options,
             key,

@@ -4,6 +4,7 @@ from django.db import models
 from autograde.mixins.models import TimeStampMixin
 
 
+# Student models
 class Student(TimeStampMixin):
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"

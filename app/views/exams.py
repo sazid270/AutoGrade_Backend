@@ -7,24 +7,25 @@ from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from app.models.exams import AnswerKey, Exam, Question
+from app.models.exams import Answer, Exam, Question
 from app.serializers.exams import (
     AnswerExtractionResponseSerializer,
     AnswerImageExtractionRequestSerializer,
-    AnswerKeyPatchSerializer,
+    AnswerPatchSerializer,
     ExamAnswerSetSerializer,
     ExamAnswersResponseSerializer,
     ExamSerializer,
     QuestionSerializer,
-    SavedAnswerEntrySerializer,
+    SavedAnswerSerializer,
 )
 from app.services.answer_extraction import (
     AnswerExtractionError,
     extract_answers_from_image,
 )
-from app.services.answer_keys import ensure_exam_questions
+from app.services.answers import ensure_exam_questions
 
 
+# Exam views
 class ExamView(viewsets.ModelViewSet):
     serializer_class = ExamSerializer
     http_method_names = ["get", "post", "patch", "delete"]
@@ -48,7 +49,7 @@ class ExamView(viewsets.ModelViewSet):
         if self.action == "extract_answers":
             return AnswerImageExtractionRequestSerializer
         if self.action == "answer_detail":
-            return AnswerKeyPatchSerializer
+            return AnswerPatchSerializer
         return super().get_serializer_class()
 
     def get_queryset(self):
@@ -66,7 +67,7 @@ class ExamView(viewsets.ModelViewSet):
             self.check_object_permissions(request, exam)
             if (
                 exam.questions.exists()
-                or exam.answer_keys.exists()
+                or exam.answers.exists()
                 or exam.batches.exists()
                 or exam.results.exists()
             ):
@@ -125,8 +126,8 @@ class ExamView(viewsets.ModelViewSet):
 
     @swagger_auto_schema(
         method="patch",
-        request_body=AnswerKeyPatchSerializer,
-        responses={200: SavedAnswerEntrySerializer},
+        request_body=AnswerPatchSerializer,
+        responses={200: SavedAnswerSerializer},
     )
     @action(
         detail=True,
@@ -142,18 +143,18 @@ class ExamView(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        answer_key = get_object_or_404(
-            AnswerKey.objects.filter(exam=exam),
+        answer = get_object_or_404(
+            Answer.objects.filter(exam=exam),
             question_number=question_number,
         )
         serializer = self.get_serializer(
-            answer_key,
+            answer,
             data=request.data,
             partial=True,
         )
         serializer.is_valid(raise_exception=True)
-        answer_key = serializer.save()
-        return Response(SavedAnswerEntrySerializer(answer_key).data)
+        answer = serializer.save()
+        return Response(SavedAnswerSerializer(answer).data)
 
     @swagger_auto_schema(
         method="post",
@@ -231,22 +232,24 @@ class ExamView(viewsets.ModelViewSet):
                     for answer in answers
                 },
             )
-            for answer in sorted(answers, key=lambda item: item["question_number"]):
-                number = answer["question_number"]
+            for extracted_answer in sorted(
+                answers, key=lambda item: item["question_number"]
+            ):
+                number = extracted_answer["question_number"]
                 question = questions[number - 1]
-                answer_key = (
-                    AnswerKey.objects.select_for_update()
+                answer = (
+                    Answer.objects.select_for_update()
                     .filter(exam=exam, question_number=number)
                     .first()
                 )
-                if answer_key is not None:
-                    answer_key.question = question
-                    answer_key.correct_options = answer["correct_options"]
-                    answer_key.source = AnswerKey.Source.SCANNED
-                    answer_key.confidence = None
-                    answer_key.needs_review = True
-                    answer_key.updated_by = request.user
-                    answer_key.save(
+                if answer is not None:
+                    answer.question = question
+                    answer.correct_options = extracted_answer["correct_options"]
+                    answer.source = Answer.Source.SCANNED
+                    answer.confidence = None
+                    answer.needs_review = True
+                    answer.updated_by = request.user
+                    answer.save(
                         update_fields=(
                             "question",
                             "correct_options",
@@ -258,16 +261,16 @@ class ExamView(viewsets.ModelViewSet):
                         )
                     )
                 else:
-                    answer_key = AnswerKey.objects.create(
+                    answer = Answer.objects.create(
                         exam=exam,
                         question_number=number,
                         question=question,
-                        correct_options=answer["correct_options"],
-                        source=AnswerKey.Source.SCANNED,
+                        correct_options=extracted_answer["correct_options"],
+                        source=Answer.Source.SCANNED,
                         needs_review=True,
                         updated_by=request.user,
                     )
-                saved_answers.append(answer_key)
+                saved_answers.append(answer)
 
         return Response(
             {
@@ -275,7 +278,7 @@ class ExamView(viewsets.ModelViewSet):
                 "source": "image",
                 "requires_review": bool(invalid_answers)
                 or any(answer.needs_review for answer in saved_answers),
-                "answers": SavedAnswerEntrySerializer(saved_answers, many=True).data,
+                "answers": SavedAnswerSerializer(saved_answers, many=True).data,
                 "conflicts": [],
                 "invalid_answers": invalid_answers,
             }
@@ -291,13 +294,14 @@ class ExamView(viewsets.ModelViewSet):
 
     @staticmethod
     def _answers_data(exam):
-        keys = AnswerKey.objects.filter(exam=exam).order_by("question_number")
+        answers = Answer.objects.filter(exam=exam).order_by("question_number")
         return {
             "exam": exam.pk,
-            "answers": SavedAnswerEntrySerializer(keys, many=True).data,
+            "answers": SavedAnswerSerializer(answers, many=True).data,
         }
 
 
+# Question views
 class QuestionView(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
     http_method_names = ["get", "post", "patch", "delete"]
@@ -320,7 +324,7 @@ class QuestionView(viewsets.ModelViewSet):
                 {"detail": "Questions cannot be deleted after scanning begins."},
                 status=status.HTTP_409_CONFLICT,
             )
-        if AnswerKey.objects.filter(question=question).exists():
+        if Answer.objects.filter(question=question).exists():
             return Response(
                 {"detail": "Questions with saved answers cannot be deleted."},
                 status=status.HTTP_409_CONFLICT,

@@ -4,6 +4,7 @@ from app.models.students import Student
 from app.utils.student_keys import normalize_roll_no, normalize_student_key
 
 
+## Student serializers
 class StudentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Student
@@ -82,7 +83,5 @@ class StudentSerializer(serializers.ModelSerializer):
                 )
             attrs["registration_no"] = registration_no
         if not values["roll_no"]:
-            raise serializers.ValidationError(
-                {"roll_no": "A roll number is required."}
-            )
+            raise serializers.ValidationError({"roll_no": "A roll number is required."})
         return attrs
