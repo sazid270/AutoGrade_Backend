@@ -92,11 +92,6 @@ class ExamView(viewsets.ModelViewSet):
                     status=status.HTTP_409_CONFLICT,
                 )
 
-    @action(detail=True, methods=("get",), url_path="answer-key-preview")
-    def answer_key_preview(self, request, **kwargs):
-        exam = self._get_exam_for_action(request, kwargs)
-        return Response(self._answer_key_preview_data(exam))
-
     @swagger_auto_schema(
         method="get",
         responses={200: ExamAnswersResponseSerializer},
@@ -300,56 +295,6 @@ class ExamView(viewsets.ModelViewSet):
         return {
             "exam": exam.pk,
             "answers": SavedAnswerEntrySerializer(keys, many=True).data,
-        }
-
-    @staticmethod
-    def _answer_key_preview_data(exam):
-        from app.services.grading import validate_exam_template
-
-        exam_questions = list(
-            exam.questions.prefetch_related("question_images").order_by("pk")
-        )
-        questions_by_number = {
-            number: question for number, question in enumerate(exam_questions, start=1)
-        }
-        keys_by_number = {
-            answer_key.question_number: answer_key
-            for answer_key in AnswerKey.objects.filter(exam=exam)
-        }
-        question_numbers = sorted(set(questions_by_number) | set(keys_by_number))
-        questions = []
-        for number in question_numbers:
-            question = questions_by_number.get(number)
-            answer_key = keys_by_number.get(number)
-            question_data = {
-                "id": question.pk if question else None,
-                "answer_key_id": answer_key.pk if answer_key else None,
-                "question_number": number,
-                "question_images": [
-                    image.image.url
-                    for image in question.question_images.all()
-                    if image.image
-                ]
-                if question
-                else [],
-                "correct_options": answer_key.correct_options if answer_key else [],
-                "source": answer_key.source if answer_key else None,
-                "needs_review": answer_key.needs_review if answer_key else False,
-            }
-            if exam.exam_type == Exam.Type.MCQ and question:
-                question_data["options_count"] = question.options_count
-                question_data["allow_multiple"] = question.allow_multiple
-            questions.append(question_data)
-        readiness_error = None
-        try:
-            validate_exam_template(exam)
-        except ValueError as exc:
-            readiness_error = str(exc)
-        return {
-            "exam": exam.pk,
-            "ready_for_scanning": readiness_error is None,
-            "readiness_error": readiness_error,
-            "questions": questions,
         }
 
 
