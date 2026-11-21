@@ -14,6 +14,7 @@ AutoGrade is a print-on-demand store that transforms creativity into high-qualit
 
 - [Installation Guide](docs/INSTALLATION.md)
 - [Server & Gunicorn Setup](docs/SERVER.md)
+- [Background Worker (Celery & Redis)](docs/CELERY.md)
 - [Scheduled Tasks (Cronjobs)](docs/CRONJOBS.md)
 - [Dependency checker (Deptry)](docs/DEPTRY.md)
 
