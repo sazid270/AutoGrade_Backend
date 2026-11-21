@@ -13,7 +13,14 @@ class StudentView(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_students"]
     filter_backends = (DjangoFilterBackend, filters.SearchFilter)
-    filterset_fields = ("grade", "section", "status", "academic_year", "institution")
+    filterset_fields = (
+        "grade",
+        "class_name",
+        "section",
+        "status",
+        "academic_year",
+        "institution",
+    )
     search_fields = ("name", "roll_no", "email")
 
     def get_queryset(self):

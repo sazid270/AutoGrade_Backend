@@ -1,44 +1,25 @@
 from django.db import transaction
+from django.http import Http404
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_yasg.utils import no_body, swagger_auto_schema
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 
-from app.models.scanning import (
-    AnswerSheet,
-    ExamScanConfiguration,
-    ScanBatch,
-    StudentAnswer,
-)
+from app.models.scanning import AnswerSheet, ScanBatch
 from app.serializers.scanning import (
+    AnswerSheetBatchSerializer,
     AnswerSheetSerializer,
-    ExamScanConfigurationSerializer,
-    ScanBatchSerializer,
-    StudentAnswerSerializer,
+    AssignStudentSerializer,
 )
 
 
-class ExamScanConfigurationView(
-    mixins.RetrieveModelMixin,
-    mixins.UpdateModelMixin,
-    viewsets.GenericViewSet,
-):
-    serializer_class = ExamScanConfigurationSerializer
-    http_method_names = ["get", "patch"]
-    swagger_tags = ["app_scanning"]
-
-    def get_queryset(self):
-        if getattr(self, "swagger_fake_view", False):
-            return ExamScanConfiguration.objects.none()
-        return ExamScanConfiguration.objects.filter(
-            exam__created_by=self.request.user
-        ).select_related("exam")
-
-
-class ScanBatchView(viewsets.ModelViewSet):
-    serializer_class = ScanBatchSerializer
+class AnswerSheetBatchView(viewsets.ModelViewSet):
+    serializer_class = AnswerSheetBatchSerializer
     http_method_names = ["get", "post", "delete"]
-    swagger_tags = ["app_scanning"]
+    parser_classes = (JSONParser,)
+    swagger_tags = ["app_answer_sheet"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("exam", "status")
 
@@ -47,34 +28,44 @@ class ScanBatchView(viewsets.ModelViewSet):
             return ScanBatch.objects.none()
         return ScanBatch.objects.filter(uploaded_by=self.request.user)
 
+    @swagger_auto_schema(tags=["app_answer_sheet_batch_status"])
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @swagger_auto_schema(tags=["app_answer_sheet_batch_status"])
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        tags=["app_answer_sheet"],
+        operation_description=(
+            "Create a batch using image IDs returned by the filesystem image-upload "
+            "API. Provide a JSON array with one ID per answer sheet. The response is "
+            "the batch record used to track processing."
+        ),
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
     def destroy(self, request, *args, **kwargs):
-        batch = self.get_object()
-        if batch.status != ScanBatch.Status.PENDING:
-            return Response(
-                {"detail": "Only pending batches can be deleted."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        return super().destroy(request, *args, **kwargs)
+        with transaction.atomic():
+            batch = self.get_object()
+            try:
+                batch = self.get_queryset().select_for_update().get(pk=batch.pk)
+            except ScanBatch.DoesNotExist as exc:
+                raise Http404 from exc
+            if batch.status != ScanBatch.Status.PENDING:
+                return Response(
+                    {"detail": "Only pending batches can be deleted."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            return super().destroy(request, *args, **kwargs)
 
-    @action(detail=True, methods=("post",))
-    def process(self, request, pk=None):
-        from app.services.grading import validate_exam_template
-        from app.tasks import process_batch_task
-
-        batch = self.get_object()
-        if batch.status != batch.Status.PENDING:
-            return Response(
-                {"detail": "Only pending batches can be processed."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        try:
-            validate_exam_template(batch.exam)
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        process_batch_task.delay(batch.pk)
-        return Response({"status": "queued"}, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=True, methods=("post",))
+    @swagger_auto_schema(
+        tags=["app_answer_sheet"],
+        request_body=no_body,
+    )
+    @action(detail=True, methods=("post",), url_path="retry-failed")
     def retry_failed(self, request, pk=None):
         from app.tasks import process_sheet_task
 
@@ -111,23 +102,35 @@ class AnswerSheetView(
     viewsets.GenericViewSet,
 ):
     serializer_class = AnswerSheetSerializer
-    swagger_tags = ["app_scanning"]
-    http_method_names = ["get", "post"]
+    swagger_tags = ["app_answer_sheet"]
+    http_method_names = ["get", "post", "patch"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("batch", "status", "student")
 
-    @action(detail=True, methods=("post",))
-    def resolve(self, request, pk=None):
+    @swagger_auto_schema(
+        tags=["app_answer_sheet"],
+        request_body=AssignStudentSerializer,
+        operation_description=(
+            "Confirm the sheet after reviewing answers. Omit student to keep the "
+            "student already matched to it."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="assign-student")
+    def assign_student(self, request, pk=None):
         from app.services.grading import resolve_sheet
 
-        student_id = request.data.get("student")
-        if not student_id:
-            return Response(
-                {"student": "A student is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        serializer = AssignStudentSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        student = serializer.validated_data.get("student")
         try:
-            sheet = resolve_sheet(self.get_object().pk, student_id, request.user)
+            sheet = resolve_sheet(
+                self.get_object().pk,
+                student.pk if student else None,
+                request.user,
+            )
         except ValueError as exc:
             return Response(
                 {"detail": str(exc)},
@@ -135,8 +138,14 @@ class AnswerSheetView(
             )
         return Response(AnswerSheetSerializer(sheet).data)
 
-    @action(detail=True, methods=("post",))
-    def keep(self, request, pk=None):
+    @swagger_auto_schema(
+        tags=["app_answer_sheet"],
+        operation_description=(
+            "Keep this sheet when duplicate sheets were detected for the student."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="keep-sheet")
+    def keep_sheet(self, request, pk=None):
         from app.services.grading import keep_sheet
 
         try:
@@ -151,17 +160,8 @@ class AnswerSheetView(
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return AnswerSheet.objects.none()
-        return AnswerSheet.objects.filter(batch__uploaded_by=self.request.user)
-
-
-class StudentAnswerView(viewsets.ModelViewSet):
-    serializer_class = StudentAnswerSerializer
-    swagger_tags = ["app_scanning"]
-    http_method_names = ["get", "patch"]
-    filter_backends = (DjangoFilterBackend,)
-    filterset_fields = ("sheet", "question", "flag", "is_overridden")
-
-    def get_queryset(self):
-        if getattr(self, "swagger_fake_view", False):
-            return StudentAnswer.objects.none()
-        return StudentAnswer.objects.filter(sheet__batch__uploaded_by=self.request.user)
+        return (
+            AnswerSheet.objects.filter(batch__uploaded_by=self.request.user)
+            .select_related("image")
+            .prefetch_related("answers")
+        )

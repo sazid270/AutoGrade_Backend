@@ -1,7 +1,22 @@
 from rest_framework import serializers
 
 from app.models.students import Student
-from app.utils.student_keys import normalize_roll_no, normalize_student_key
+from app.utils.student_keys import (
+    normalize_class_name,
+    normalize_roll_no,
+    normalize_section,
+    normalize_student_key,
+)
+
+
+def normalize_field(field, value):
+    if field == "roll_no":
+        return normalize_roll_no(value)
+    if field == "section":
+        return normalize_section(value)
+    if field == "class_name":
+        return normalize_class_name(value)
+    return normalize_student_key(value)
 
 
 ## Student serializers
@@ -13,8 +28,8 @@ class StudentSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
-        for field in ("institution", "grade", "section", "academic_year"):
-            validated_data[field] = normalize_student_key(validated_data.get(field))
+        for field in ("institution", "class_name", "section", "academic_year"):
+            validated_data[field] = normalize_field(field, validated_data.get(field))
         validated_data["roll_no"] = normalize_roll_no(validated_data.get("roll_no"))
         if "registration_no" in validated_data:
             validated_data["registration_no"] = normalize_student_key(
@@ -23,9 +38,9 @@ class StudentSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        for field in ("institution", "grade", "section", "academic_year"):
+        for field in ("institution", "class_name", "section", "academic_year"):
             if field in validated_data:
-                validated_data[field] = normalize_student_key(validated_data[field])
+                validated_data[field] = normalize_field(field, validated_data[field])
         if "roll_no" in validated_data:
             validated_data["roll_no"] = normalize_roll_no(validated_data["roll_no"])
         if "registration_no" in validated_data:
@@ -36,26 +51,35 @@ class StudentSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         values = {
-            field: normalize_roll_no(
-                attrs.get(field, getattr(self.instance, field, ""))
-            )
-            if field == "roll_no"
-            else normalize_student_key(
-                attrs.get(field, getattr(self.instance, field, ""))
+            field: normalize_field(
+                field,
+                attrs.get(field, getattr(self.instance, field, "")),
             )
             for field in (
                 "institution",
-                "grade",
+                "class_name",
                 "section",
                 "academic_year",
                 "roll_no",
             )
         }
+        class_name = normalize_class_name(
+            attrs.get("class_name", getattr(self.instance, "class_name", ""))
+        )
         owner = self.context["request"].user
-        duplicate = Student.objects.filter(created_by=owner, **values)
+        duplicate = Student.objects.filter(
+            created_by=owner,
+            institution=values["institution"],
+            section=values["section"],
+            academic_year=values["academic_year"],
+            roll_no=values["roll_no"],
+        )
         if self.instance:
             duplicate = duplicate.exclude(pk=self.instance.pk)
-        if duplicate.exists():
+        if any(
+            normalize_class_name(student.class_name) == normalize_class_name(class_name)
+            for student in duplicate
+        ):
             raise serializers.ValidationError(
                 {
                     "roll_no": "A student with this roll number already exists in this context."

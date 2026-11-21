@@ -19,7 +19,11 @@ class Student(TimeStampMixin):
     roll_no = models.CharField(max_length=32)
     registration_no = models.CharField(max_length=64, blank=True)
     name = models.CharField(max_length=255, blank=True)
-    grade = models.CharField(max_length=64, blank=True)
+    grade = models.CharField(
+        max_length=64,
+        blank=True,
+        help_text="Letter grade such as A+, A, A-, B (depends on marks).",
+    )
     class_name = models.CharField(max_length=64, blank=True)
     section = models.CharField(max_length=32, blank=True)
     academic_year = models.CharField(max_length=16, blank=True)
@@ -47,7 +51,7 @@ class Student(TimeStampMixin):
                 fields=(
                     "created_by",
                     "institution",
-                    "grade",
+                    "class_name",
                     "section",
                     "academic_year",
                     "roll_no",

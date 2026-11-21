@@ -30,6 +30,13 @@ class Exam(TimeStampMixin):
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
     )
+    mcq_mark = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Marks awarded for each correct MCQ answer.",
+    )
     negative_marks = models.FloatField(
         default=0.0,
         validators=[MinValueValidator(0)],
@@ -79,15 +86,9 @@ class Answer(models.Model):
         MANUAL_EDIT = "manual_edit", "Manual edit"
 
     question = models.OneToOneField(
-        Question,
-        on_delete=models.CASCADE,
-        related_name="answer",
+        Question, on_delete=models.CASCADE, related_name="answer"
     )
-    exam = models.ForeignKey(
-        Exam,
-        on_delete=models.CASCADE,
-        related_name="answers",
-    )
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="answers")
     question_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     correct_options = models.JSONField(default=list)
     source = models.CharField(max_length=16, choices=Source.choices)

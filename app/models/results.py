@@ -2,7 +2,6 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import models
-from simple_history.models import HistoricalRecords
 
 from app.models.exams import Exam
 from app.models.scanning import AnswerSheet
@@ -33,7 +32,6 @@ class Result(TimeStampMixin):
     updated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
     )
-    history = HistoricalRecords()
 
     class Meta:
         constraints = [
@@ -46,20 +44,5 @@ class Result(TimeStampMixin):
         return f"{self.exam} - {self.student}"
 
     def recalculate(self):
-        answers = list(self.sheet.answers.all()) if self.sheet_id else []
-        is_mcq_exam = self.exam.exam_type == Exam.Type.MCQ
-        mcq_answers = answers if is_mcq_exam else []
-        cq_answers = [] if is_mcq_exam else answers
-        mcq_marks = sum(
-            (answer.marks_awarded for answer in mcq_answers),
-            Decimal("0"),
-        )
-        cq_marks = (
-            sum((answer.marks_awarded for answer in cq_answers), Decimal("0"))
-            if cq_answers
-            else None
-        )
-        self.mcq_marks = mcq_marks
-        self.cq_marks = cq_marks
-        self.total_marks = mcq_marks + (cq_marks or Decimal("0"))
+        self.total_marks = self.mcq_marks + (self.cq_marks or Decimal("0"))
         return self

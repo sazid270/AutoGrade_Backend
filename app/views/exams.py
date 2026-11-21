@@ -11,18 +11,21 @@ from app.models.exams import Answer, Exam, Question
 from app.serializers.exams import (
     AnswerExtractionResponseSerializer,
     AnswerImageExtractionRequestSerializer,
-    AnswerPatchSerializer,
     ExamAnswerSetSerializer,
     ExamAnswersResponseSerializer,
     ExamSerializer,
+    QuestionPatchSerializer,
     QuestionSerializer,
     SavedAnswerSerializer,
 )
-from app.services.answer_extraction import (
-    AnswerExtractionError,
-    extract_answers_from_image,
+from app.services.ai_provider import (
+    AIProviderError,
+    ConfigurationError,
+    SheetImageError,
 )
+from app.services.answer_extraction import extract_answers_from_image
 from app.services.answers import ensure_exam_questions
+from app.utils.options import BENGALI_DIGITS, normalize_options
 
 
 # Exam views
@@ -48,8 +51,6 @@ class ExamView(viewsets.ModelViewSet):
             return ExamAnswerSetSerializer
         if self.action == "extract_answers":
             return AnswerImageExtractionRequestSerializer
-        if self.action == "answer_detail":
-            return AnswerPatchSerializer
         return super().get_serializer_class()
 
     def get_queryset(self):
@@ -95,16 +96,22 @@ class ExamView(viewsets.ModelViewSet):
 
     @swagger_auto_schema(
         method="get",
+        tags=["app_answers"],
         responses={200: ExamAnswersResponseSerializer},
     )
     @swagger_auto_schema(
         method="post",
+        tags=["app_answers"],
         request_body=ExamAnswerSetSerializer,
         responses={200: ExamAnswersResponseSerializer},
+        operation_description=(
+            "Create or change answers. Send only the entries you want to add or "
+            "change; omitted answers are left untouched. Posting an extracted answer "
+            "confirms it. Processed sheets are re-graded when answers change."
+        ),
     )
     @action(detail=True, methods=("get", "post"), url_path="answers")
     def answers(self, request, **kwargs):
-        """List or upsert supplied MCQ answers without deleting omitted entries."""
         exam = self._get_exam_for_action(request, kwargs)
         if exam.exam_type != Exam.Type.MCQ:
             return Response(
@@ -125,39 +132,8 @@ class ExamView(viewsets.ModelViewSet):
         return Response(self._answers_data(exam))
 
     @swagger_auto_schema(
-        method="patch",
-        request_body=AnswerPatchSerializer,
-        responses={200: SavedAnswerSerializer},
-    )
-    @action(
-        detail=True,
-        methods=("patch",),
-        url_path=r"answers/(?P<question_number>\d+)",
-    )
-    def answer_detail(self, request, question_number, **kwargs):
-        exam = self._get_exam_for_action(request, kwargs)
-        if exam.exam_type != Exam.Type.MCQ:
-            return Response(
-                {
-                    "detail": "Teacher answers are currently supported for MCQ exams only."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        answer = get_object_or_404(
-            Answer.objects.filter(exam=exam),
-            question_number=question_number,
-        )
-        serializer = self.get_serializer(
-            answer,
-            data=request.data,
-            partial=True,
-        )
-        serializer.is_valid(raise_exception=True)
-        answer = serializer.save()
-        return Response(SavedAnswerSerializer(answer).data)
-
-    @swagger_auto_schema(
         method="post",
+        tags=["app_answers"],
         request_body=AnswerImageExtractionRequestSerializer,
         responses={200: AnswerExtractionResponseSerializer},
     )
@@ -174,7 +150,14 @@ class ExamView(viewsets.ModelViewSet):
         image = serializer.validated_data["image_id"]
         try:
             extracted = extract_answers_from_image(image)
-        except AnswerExtractionError as exc:
+        except ConfigurationError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SheetImageError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except AIProviderError as exc:
             return Response({"detail": exc.detail}, status=exc.status_code)
 
         answers = []
@@ -188,6 +171,9 @@ class ExamView(viewsets.ModelViewSet):
                 continue
             number = item.get("question_number")
             options = item.get("correct_options")
+            if isinstance(number, str):
+                digits = number.strip().translate(BENGALI_DIGITS)
+                number = int(digits) if digits.isdigit() else number
             if not isinstance(number, int) or isinstance(number, bool) or number < 1:
                 invalid_answers.append(
                     {"index": index, "reason": "Invalid question_number."}
@@ -205,15 +191,12 @@ class ExamView(viewsets.ModelViewSet):
                     {"question_number": number, "reason": "Invalid options list."}
                 )
                 continue
-            normalized_options = sorted({option.strip().upper() for option in options})
-            if not normalized_options or not all(
-                len(option) == 1 and "A" <= option <= "J"
-                for option in normalized_options
-            ):
+            normalized_options, bad = normalize_options(options)
+            if bad or not normalized_options:
                 invalid_answers.append(
                     {
                         "question_number": number,
-                        "reason": "Answer options must be letters A through J.",
+                        "reason": "Options must be labels A to J (or ক to ঞ).",
                     }
                 )
                 continue
@@ -223,31 +206,77 @@ class ExamView(viewsets.ModelViewSet):
             )
 
         saved_answers = []
+        conflicts = []
         with transaction.atomic():
             exam = Exam.objects.select_for_update().get(pk=exam.pk)
-            questions = ensure_exam_questions(
-                exam,
-                {
-                    answer["question_number"]: answer["correct_options"]
-                    for answer in answers
-                },
-            )
+            questions = list(exam.questions.select_for_update().order_by("pk"))
+            locked = exam.batches.exists()
+            accepted_answers = []
             for extracted_answer in sorted(
                 answers, key=lambda item: item["question_number"]
             ):
                 number = extracted_answer["question_number"]
+                options = extracted_answer["correct_options"]
+                if number > len(questions) and locked:
+                    invalid_answers.append(
+                        {
+                            "question_number": number,
+                            "reason": (
+                                "Questions cannot be added after scanning begins."
+                            ),
+                        }
+                    )
+                    continue
+                if number <= len(questions):
+                    question = questions[number - 1]
+                    allowed = {
+                        chr(ord("A") + index) for index in range(question.options_count)
+                    }
+                    if not set(options).issubset(allowed) or (
+                        len(options) > 1 and not question.allow_multiple
+                    ):
+                        invalid_answers.append(
+                            {
+                                "question_number": number,
+                                "reason": (
+                                    "Does not fit this question's options setting."
+                                ),
+                            }
+                        )
+                        continue
+                accepted_answers.append(extracted_answer)
+
+            questions = ensure_exam_questions(
+                exam,
+                {
+                    item["question_number"]: item["correct_options"]
+                    for item in accepted_answers
+                },
+            )
+            for extracted_answer in accepted_answers:
+                number = extracted_answer["question_number"]
+                options = extracted_answer["correct_options"]
                 question = questions[number - 1]
                 answer = (
                     Answer.objects.select_for_update()
                     .filter(exam=exam, question_number=number)
                     .first()
                 )
-                if answer is not None:
+                if answer is None:
+                    answer = Answer.objects.create(
+                        exam=exam,
+                        question_number=number,
+                        question=question,
+                        correct_options=options,
+                        source=Answer.Source.SCANNED,
+                        needs_review=True,
+                        updated_by=request.user,
+                    )
+                elif answer.needs_review:
                     answer.question = question
-                    answer.correct_options = extracted_answer["correct_options"]
+                    answer.correct_options = options
                     answer.source = Answer.Source.SCANNED
                     answer.confidence = None
-                    answer.needs_review = True
                     answer.updated_by = request.user
                     answer.save(
                         update_fields=(
@@ -255,20 +284,17 @@ class ExamView(viewsets.ModelViewSet):
                             "correct_options",
                             "source",
                             "confidence",
-                            "needs_review",
                             "updated_by",
                             "updated_at",
                         )
                     )
-                else:
-                    answer = Answer.objects.create(
-                        exam=exam,
-                        question_number=number,
-                        question=question,
-                        correct_options=extracted_answer["correct_options"],
-                        source=Answer.Source.SCANNED,
-                        needs_review=True,
-                        updated_by=request.user,
+                elif sorted(answer.correct_options) != options:
+                    conflicts.append(
+                        {
+                            "question_number": number,
+                            "existing_options": sorted(answer.correct_options),
+                            "extracted_options": options,
+                        }
                     )
                 saved_answers.append(answer)
 
@@ -277,9 +303,10 @@ class ExamView(viewsets.ModelViewSet):
                 "exam": exam.pk,
                 "source": "image",
                 "requires_review": bool(invalid_answers)
+                or bool(conflicts)
                 or any(answer.needs_review for answer in saved_answers),
                 "answers": SavedAnswerSerializer(saved_answers, many=True).data,
-                "conflicts": [],
+                "conflicts": conflicts,
                 "invalid_answers": invalid_answers,
             }
         )
@@ -311,9 +338,15 @@ class QuestionView(viewsets.ModelViewSet):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return Question.objects.none()
-        return Question.objects.filter(
-            exam__created_by=self.request.user
-        ).prefetch_related("question_images")
+        return (
+            Question.objects.filter(exam__created_by=self.request.user)
+            .select_related("exam")
+            .prefetch_related("question_images")
+        )
+
+    @swagger_auto_schema(request_body=QuestionPatchSerializer)
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
 
     @transaction.atomic
     def destroy(self, request, *args, **kwargs):
