@@ -4,10 +4,8 @@ from celery import shared_task
 from django.db import transaction
 
 from app.models.scanning import AnswerSheet, ScanBatch
-from app.services.ai_provider import ProviderTransientError
 from app.services.grading import process_sheet
 
-SHEET_PROVIDER_MAX_RETRIES = 5
 logger = logging.getLogger(__name__)
 
 
@@ -51,15 +49,10 @@ def _record_sheet_completion(
 
 
 @shared_task(
-    bind=True,
     acks_late=True,
     reject_on_worker_lost=True,
-    rate_limit="15/m",
-    autoretry_for=(ProviderTransientError,),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": SHEET_PROVIDER_MAX_RETRIES},
 )
-def process_sheet_task(self, sheet_id: int) -> int | None:
+def process_sheet_task(sheet_id: int) -> int | None:
     try:
         sheet = AnswerSheet.objects.select_related("batch").get(pk=sheet_id)
     except AnswerSheet.DoesNotExist:
@@ -69,22 +62,12 @@ def process_sheet_task(self, sheet_id: int) -> int | None:
         AnswerSheet.Status.PROCESSED,
         AnswerSheet.Status.NEEDS_REVIEW,
         AnswerSheet.Status.FAILED,
+        AnswerSheet.Status.DISCARDED,
     ):
         _record_sheet_completion(sheet.batch_id)
         return sheet.pk
     try:
         sheet = process_sheet(sheet_id)
-    except ProviderTransientError as exc:
-        if self.request.retries < SHEET_PROVIDER_MAX_RETRIES:
-            raise
-        batch_id = sheet.batch_id
-        AnswerSheet.objects.filter(pk=sheet_id).update(
-            status=AnswerSheet.Status.FAILED,
-            error_message=str(exc),
-            processed_at=None,
-        )
-        _record_sheet_completion(batch_id)
-        return sheet_id
     except Exception as exc:
         batch_id = sheet.batch_id
         AnswerSheet.objects.filter(pk=sheet_id).update(

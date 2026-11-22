@@ -1,9 +1,7 @@
 import logging
 import time
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
 
-from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -11,15 +9,8 @@ from app.models.exams import Exam
 from app.models.results import Result
 from app.models.scanning import AnswerSheet, StudentAnswer
 from app.models.students import Student
-from app.services.ai_provider import (
-    AIProviderError,
-    ProviderTransientError,
-    free_vision_models,
-    validate_sheet_image,
-    validate_sheet_reading_config,
-)
-from app.services.sheet_reading import read_answer_sheet
-from app.utils.options import BENGALI_DIGITS
+from app.services.ai_provider import validate_sheet_image
+from app.services.sheet_template import TemplateMismatch, read_with_template
 from app.utils.student_keys import (
     normalize_class_name,
     normalize_roll_no,
@@ -28,11 +19,6 @@ from app.utils.student_keys import (
 )
 
 logger = logging.getLogger(__name__)
-LAST_GOOD_MODEL_KEY = "openrouter_last_good_sheet_model"
-
-
-def _code_key(value: str | None) -> str:
-    return normalize_student_key(value).translate(BENGALI_DIGITS)
 
 
 def validate_exam_ready(exam: Exam) -> None:
@@ -138,96 +124,67 @@ def regrade_exam(exam: Exam) -> int:
     return len(sheet_ids)
 
 
-def _read_with_fallback(
-    image,
-    *,
-    question_numbers: list[int],
-    options_count: dict[int, int],
-) -> tuple[str, dict[str, Any]]:
-    models = free_vision_models()
-    preferred = cache.get(LAST_GOOD_MODEL_KEY)
-    if preferred in models:
-        models = [preferred] + [model for model in models if model != preferred]
-    last_error = None
-    for model in models[:3]:
-        try:
-            result = read_answer_sheet(
-                image,
-                question_numbers=question_numbers,
-                options_count=options_count,
-                model=model,
-            )
-        except ProviderTransientError as exc:
-            if exc.status_code == 429:
-                raise
-            last_error = exc
-            if exc.status_code == 404:
-                free_vision_models(refresh=True)
-        except AIProviderError as exc:
-            last_error = exc
-            if exc.status_code == 404:
-                free_vision_models(refresh=True)
-        else:
-            cache.set(LAST_GOOD_MODEL_KEY, model, timeout=6 * 3600)
-            return model, result
-    raise last_error or ProviderTransientError("No free vision model is available.")
-
-
 def process_sheet(sheet_id: int) -> AnswerSheet:
-    initial = AnswerSheet.objects.select_related("batch__exam", "image").get(
-        pk=sheet_id
-    )
+    initial = AnswerSheet.objects.select_related(
+        "batch__exam",
+        "batch__template",
+        "image",
+    ).get(pk=sheet_id)
     exam = initial.batch.exam
-    validate_sheet_reading_config()
     validate_sheet_image(initial.image)
     validate_exam_ready(exam)
     questions = list(exam.questions.order_by("pk"))
     question_numbers = list(range(1, len(questions) + 1))
-    options_count = {
-        number: question.options_count
-        for number, question in zip(question_numbers, questions)
-    }
     started = time.monotonic()
-    model, read = _read_with_fallback(
-        initial.image,
-        question_numbers=question_numbers,
-        options_count=options_count,
-    )
+    try:
+        if initial.batch.template_id is None:
+            raise TemplateMismatch("No OMR template is assigned to this batch.")
+        read = read_with_template(
+            initial,
+            initial.batch.template.structure,
+            question_numbers,
+        )
+    except TemplateMismatch as exc:
+        logger.info("Sheet %s requires review: %s", sheet_id, exc)
+        read = {
+            "answers": {number: [] for number in question_numbers},
+            "unclear": question_numbers,
+            "unclear_fields": {"roll"},
+            "invalid": True,
+            "name": "",
+            "roll": "",
+            "registration": "",
+            "class_name": "",
+            "section": "",
+            "subject_code": "",
+            "set_code": "",
+        }
     logger.info(
-        "Sheet %s read by %s in %.1fs",
+        "Sheet %s read by OpenCV in %.1fs",
         sheet_id,
-        model,
         time.monotonic() - started,
     )
     reasons = [
         {"field": "answer", "question_number": number} for number in read["unclear"]
     ]
+    if read["invalid"]:
+        reasons.append({"field": "layout_mismatch"})
     if sum(1 for options in read["answers"].values() if not options) * 2 > len(
         question_numbers
     ):
         reasons.append({"field": "many_blank_answers"})
     unclear = read["unclear_fields"]
     exam_section = normalize_section(exam.section)
-    sheet_section = normalize_section(read["section"])
+    sheet_section = normalize_section(read["section"]) or normalize_section(
+        exam.section
+    )
     exam_class = normalize_class_name(exam.class_or_batch)
-    sheet_class = normalize_class_name(read["class_name"])
-    section_bad = bool(
-        (exam_section and sheet_section and sheet_section != exam_section)
-        or "section" in unclear
-    )
-    class_bad = bool(
-        (exam_class and sheet_class and sheet_class != exam_class)
-        or "class_name" in unclear
-    )
-    if section_bad:
-        reasons.append(
-            {"field": "section", "read": sheet_section, "expected": exam_section}
-        )
-    if class_bad:
-        reasons.append({"field": "class", "read": sheet_class, "expected": exam_class})
+    sheet_class = normalize_class_name(read["class_name"]) or exam_class
+    if "roll" in unclear:
+        reasons.append({"field": "roll"})
     if "registration" in unclear:
         reasons.append({"field": "registration"})
-    identity_unreliable = section_bad or class_bad or "roll" in unclear
+    identity_unreliable = "roll" in unclear
     section = exam_section or sheet_section
     class_name = exam_class or sheet_class
     class_key = class_name
@@ -326,28 +283,6 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
                 if mismatched:
                     reasons.append({"field": "student_context"})
 
-        subject_code = _code_key(read["subject_code"])
-        exam_subject_code = _code_key(exam.subject_code)
-        if exam_subject_code and subject_code and subject_code != exam_subject_code:
-            reasons.append(
-                {
-                    "field": "subject_code",
-                    "read": subject_code,
-                    "expected": exam_subject_code,
-                }
-            )
-
-        set_code = normalize_section(read["set_code"])
-        exam_set_code = normalize_section(exam.set_code)
-        if exam_set_code and set_code and set_code != exam_set_code:
-            reasons.append(
-                {
-                    "field": "set_code",
-                    "read": set_code,
-                    "expected": exam_set_code,
-                }
-            )
-
         duplicate = bool(
             student
             and AnswerSheet.objects.filter(
@@ -428,10 +363,10 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
 
 
 @transaction.atomic
-def resolve_sheet(sheet_id: int, student_id: int, user) -> AnswerSheet:
+def resolve_sheet(sheet_id: int, user) -> AnswerSheet:
     sheet = (
         AnswerSheet.objects.select_for_update()
-        .select_related("batch__exam")
+        .select_related("batch__exam", "student")
         .get(pk=sheet_id)
     )
     if sheet.batch.uploaded_by_id != user.id:
@@ -439,18 +374,9 @@ def resolve_sheet(sheet_id: int, student_id: int, user) -> AnswerSheet:
     if sheet.status != AnswerSheet.Status.NEEDS_REVIEW:
         raise ValueError("Only sheets that need review can be resolved.")
     exam = sheet.batch.exam
-    if student_id is None:
-        student = sheet.student
-        if student is None:
-            raise ValueError("Select a student for this sheet.")
-    else:
-        student = (
-            Student.objects.select_for_update()
-            .filter(pk=student_id, created_by_id=user.id)
-            .first()
-        )
-        if student is None:
-            raise ValueError("The selected student does not belong to your account.")
+    student = sheet.student
+    if student is None:
+        raise ValueError("Select a student for this sheet.")
     exam_section = normalize_section(exam.section)
     if (
         normalize_student_key(student.institution)
@@ -503,50 +429,26 @@ def resolve_sheet(sheet_id: int, student_id: int, user) -> AnswerSheet:
 
 
 @transaction.atomic
-def keep_sheet(sheet_id: int, user) -> AnswerSheet:
-    winner = (
-        AnswerSheet.objects.select_for_update()
-        .select_related("batch__exam")
-        .get(pk=sheet_id)
+def discard_sheet(sheet_id: int, user) -> AnswerSheet:
+    sheet = (
+        AnswerSheet.objects.select_for_update().select_related("batch").get(pk=sheet_id)
     )
-    if winner.batch.uploaded_by_id != user.id or winner.student_id is None:
-        raise ValueError("The winning sheet must belong to you and have a student.")
-    losers = list(
-        AnswerSheet.objects.select_for_update()
-        .filter(batch__exam=winner.batch.exam, student_id=winner.student_id)
-        .exclude(pk=winner.pk)
-    )
-    if not losers:
-        raise ValueError("No duplicate sheet exists for this student and exam.")
-    affected_batch_ids = {winner.batch_id}
-    for loser in losers:
-        affected_batch_ids.add(loser.batch_id)
-        for result in Result.objects.select_for_update().filter(sheet=loser):
-            if result.finalized or result.is_overridden:
-                raise ValueError(
-                    "A duplicate sheet has a finalized or overridden result."
-                )
-        loser.student = None
-        loser.status = AnswerSheet.Status.DISCARDED
-        loser.error_message = "Discarded because another duplicate sheet was kept."
-        loser.save(update_fields=("student", "status", "error_message"))
-        Result.objects.filter(sheet=loser).delete()
-    winner.status = AnswerSheet.Status.PROCESSED
-    winner.review_reasons = []
-    winner.error_message = ""
-    winner.save(update_fields=("status", "review_reasons", "error_message"))
-    result, _ = Result.objects.get_or_create(
-        exam=winner.batch.exam,
-        student=winner.student,
-        defaults={
-            "sheet": winner,
-            "mcq_marks": winner.scanned_mcq_marks,
-            "total_marks": winner.scanned_mcq_marks,
-        },
-    )
-    _update_result_from_sheet(result, winner)
+    if sheet.batch.uploaded_by_id != user.id:
+        raise ValueError("You cannot discard another user's sheet.")
+    if sheet.status == AnswerSheet.Status.PENDING:
+        raise ValueError("A sheet that is still processing cannot be discarded.")
+    for result in Result.objects.select_for_update().filter(sheet=sheet):
+        if result.finalized or result.is_overridden:
+            raise ValueError(
+                "This sheet has a finalized or edited result. Edit the result instead."
+            )
+    Result.objects.filter(sheet=sheet).delete()
+    sheet.student = None
+    sheet.status = AnswerSheet.Status.DISCARDED
+    sheet.review_reasons = []
+    sheet.error_message = "Discarded by the teacher."
+    sheet.save(update_fields=("student", "status", "review_reasons", "error_message"))
     from app.tasks import _record_sheet_completion
 
-    for batch_id in affected_batch_ids:
-        _record_sheet_completion(batch_id)
-    return winner
+    _record_sheet_completion(sheet.batch_id)
+    return sheet

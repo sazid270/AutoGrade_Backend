@@ -7,6 +7,7 @@ from app.views.scanning import (
     AnswerSheetBatchView,
     AnswerSheetView,
 )
+from app.views.sheet_templates import SheetTemplateViewSet
 from app.views.students import StudentView
 
 router = DefaultRouter()
@@ -26,5 +27,6 @@ router.register(
     basename="answer-sheet-batch",
 )
 router.register("answer-sheets", AnswerSheetView, basename="answer-sheet")
+router.register("sheet-templates", SheetTemplateViewSet, basename="sheet-template")
 
 urlpatterns = [path(r"", include(router.urls))]

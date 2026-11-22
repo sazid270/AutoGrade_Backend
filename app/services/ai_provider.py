@@ -183,12 +183,35 @@ def image_content(image: ImageModel, *, max_edge: int = 1600) -> dict[str, Any]:
         ) from exc
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     url = f"data:image/jpeg;base64,{encoded}"
-    if urlparse(settings.OPENROUTER_BASE_URL).hostname in {
-        "generativelanguage.googleapis.com",
-        "openrouter.ai",
-    }:
-        url = {"url": url}
-    return {"type": "image_url", "image_url": url}
+    return {"type": "image_url", "image_url": _wrap_url(url)}
+
+
+def _wrap_url(url: str):
+    host = urlparse(settings.OPENROUTER_BASE_URL).hostname
+    return (
+        {"url": url}
+        if host
+        in {
+            "generativelanguage.googleapis.com",
+            "openrouter.ai",
+        }
+        else url
+    )
+
+
+def array_content(gray, *, quality: int = 85) -> dict[str, Any]:
+    import cv2
+
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        gray,
+        [cv2.IMWRITE_JPEG_QUALITY, quality],
+    )
+    if not ok:
+        raise AIProviderError("The image could not be encoded.", status_code=400)
+    encoded = base64.b64encode(buffer).decode("ascii")
+    url = f"data:image/jpeg;base64,{encoded}"
+    return {"type": "image_url", "image_url": _wrap_url(url)}
 
 
 def output_text(response_data: dict[str, Any]) -> str:

@@ -7,6 +7,24 @@ from autograde.mixins.models import TimeStampMixin
 from filesystem.models.models import ImageModel
 
 
+class SheetTemplate(TimeStampMixin):
+    name = models.CharField(max_length=255)
+    structure = models.JSONField()
+    reference_image = models.ForeignKey(
+        ImageModel,
+        on_delete=models.PROTECT,
+        related_name="sheet_templates",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="sheet_templates",
+    )
+
+    def __str__(self):
+        return self.name
+
+
 class ScanBatch(TimeStampMixin):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -24,6 +42,13 @@ class ScanBatch(TimeStampMixin):
     processed_count = models.PositiveIntegerField(default=0)
     flagged_count = models.PositiveIntegerField(default=0)
     failed_count = models.PositiveIntegerField(default=0)
+    template = models.ForeignKey(
+        SheetTemplate,
+        on_delete=models.PROTECT,
+        related_name="batches",
+        null=True,
+        blank=True,
+    )
 
     def __str__(self):
         return f"Answer-sheet batch {self.pk} for {self.exam}"

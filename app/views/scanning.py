@@ -11,7 +11,6 @@ from app.models.scanning import AnswerSheet, ScanBatch
 from app.serializers.scanning import (
     AnswerSheetBatchSerializer,
     AnswerSheetSerializer,
-    AssignStudentSerializer,
 )
 
 
@@ -106,56 +105,6 @@ class AnswerSheetView(
     http_method_names = ["get", "post", "patch"]
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ("batch", "status", "student")
-
-    @swagger_auto_schema(
-        tags=["app_answer_sheet"],
-        request_body=AssignStudentSerializer,
-        operation_description=(
-            "Confirm the sheet after reviewing answers. Omit student to keep the "
-            "student already matched to it."
-        ),
-    )
-    @action(detail=True, methods=("post",), url_path="assign-student")
-    def assign_student(self, request, pk=None):
-        from app.services.grading import resolve_sheet
-
-        serializer = AssignStudentSerializer(
-            data=request.data,
-            context={"request": request},
-        )
-        serializer.is_valid(raise_exception=True)
-        student = serializer.validated_data.get("student")
-        try:
-            sheet = resolve_sheet(
-                self.get_object().pk,
-                student.pk if student else None,
-                request.user,
-            )
-        except ValueError as exc:
-            return Response(
-                {"detail": str(exc)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return Response(AnswerSheetSerializer(sheet).data)
-
-    @swagger_auto_schema(
-        tags=["app_answer_sheet"],
-        operation_description=(
-            "Keep this sheet when duplicate sheets were detected for the student."
-        ),
-    )
-    @action(detail=True, methods=("post",), url_path="keep-sheet")
-    def keep_sheet(self, request, pk=None):
-        from app.services.grading import keep_sheet
-
-        try:
-            sheet = keep_sheet(self.get_object().pk, request.user)
-        except ValueError as exc:
-            return Response(
-                {"detail": str(exc)},
-                status=status.HTTP_409_CONFLICT,
-            )
-        return Response(AnswerSheetSerializer(sheet).data)
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):

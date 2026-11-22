@@ -2,12 +2,7 @@ from django.db import transaction
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
 
-from app.models.scanning import AnswerSheet, ScanBatch, StudentAnswer
-from app.models.students import Student
-from app.services.ai_provider import (
-    ConfigurationError,
-    validate_sheet_reading_config,
-)
+from app.models.scanning import AnswerSheet, ScanBatch, SheetTemplate, StudentAnswer
 from app.services.grading import validate_exam_ready
 from app.utils.options import normalize_options
 from filesystem.models.models import ImageModel
@@ -19,6 +14,10 @@ class SheetReadingUnavailable(APIException):
 
 
 class AnswerSheetBatchSerializer(serializers.ModelSerializer):
+    template = serializers.PrimaryKeyRelatedField(
+        queryset=SheetTemplate.objects.all(),
+        required=True,
+    )
     image_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1),
         write_only=True,
@@ -48,13 +47,32 @@ class AnswerSheetBatchSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(str(exc)) from exc
         return value
 
+    def validate_template(self, value):
+        if value.created_by_id != self.context["request"].user.id:
+            raise serializers.ValidationError(
+                "You cannot use another user's sheet template."
+            )
+        return value
+
     def validate(self, attrs):
         if self.instance is not None:
             return attrs
-        try:
-            validate_sheet_reading_config()
-        except ConfigurationError as exc:
-            raise SheetReadingUnavailable(str(exc)) from exc
+        exam = attrs["exam"]
+        structure = attrs["template"].structure
+        questions = list(exam.questions.order_by("pk"))
+        options = structure.get("options_per_question")
+        if not isinstance(options, list) or len(options) != len(questions):
+            raise serializers.ValidationError(
+                {"template": ("The template question count does not match the exam.")}
+            )
+        if options != [question.options_count for question in questions]:
+            raise serializers.ValidationError(
+                {
+                    "template": (
+                        "The template option counts do not match the exam questions."
+                    )
+                }
+            )
 
         image_ids = attrs["image_ids"]
         if len(image_ids) != len(set(image_ids)):
@@ -82,6 +100,18 @@ class AnswerSheetBatchSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
+        template = SheetTemplate.objects.select_for_update().get(
+            pk=validated_data["template"].pk
+        )
+        questions = list(validated_data["exam"].questions.order_by("pk"))
+        options = template.structure.get("options_per_question")
+        if not isinstance(options, list) or options != [
+            question.options_count for question in questions
+        ]:
+            raise serializers.ValidationError(
+                {"template": "The template no longer matches the exam questions."}
+            )
+        validated_data["template"] = template
         validated_data.pop("image_ids")
         images = validated_data.pop("images")
         batch = ScanBatch.objects.create(
@@ -125,6 +155,11 @@ class StudentAnswerSerializer(serializers.ModelSerializer):
 class AnswerSheetSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
     answers = StudentAnswerSerializer(many=True, required=False)
+    discard = serializers.BooleanField(
+        write_only=True,
+        required=False,
+        help_text="Discard this sheet, for example a duplicate.",
+    )
 
     class Meta:
         model = AnswerSheet
@@ -132,7 +167,6 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "batch",
             "image",
-            "student",
             "scanned_mcq_marks",
             "status",
             "error_message",
@@ -142,6 +176,13 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
 
     def get_image_url(self, obj):
         return obj.image.image.url if obj.image.image else None
+
+    def validate_student(self, value):
+        if value is not None and value.created_by_id != self.context["request"].user.id:
+            raise serializers.ValidationError(
+                "The selected student does not belong to your account."
+            )
+        return value
 
     def validate_answers(self, value):
         if self.instance is None:
@@ -171,10 +212,29 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def update(self, instance, validated_data):
+        from app.services.grading import (
+            discard_sheet,
+            recompute_sheet,
+            resolve_sheet,
+        )
+
+        user = self.context["request"].user
+        discard = validated_data.pop("discard", False)
         answers = validated_data.pop("answers", None)
+        if (
+            "student" in validated_data
+            and instance.status != AnswerSheet.Status.NEEDS_REVIEW
+        ):
+            raise serializers.ValidationError(
+                {
+                    "student": (
+                        "Change the student only while the sheet needs review. "
+                        "Otherwise edit the student record."
+                    )
+                }
+            )
         sheet = super().update(instance, validated_data)
         if answers is not None:
-            user = self.context["request"].user
             for item in answers:
                 StudentAnswer.objects.update_or_create(
                     sheet=sheet,
@@ -186,22 +246,13 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
                         "updated_by": user,
                     },
                 )
-            from app.services.grading import recompute_sheet
-
-            sheet = recompute_sheet(sheet.pk)
+        try:
+            if discard:
+                return discard_sheet(sheet.pk, user)
+            if answers is not None:
+                sheet = recompute_sheet(sheet.pk)
+            if sheet.status == AnswerSheet.Status.NEEDS_REVIEW and sheet.student_id:
+                sheet = resolve_sheet(sheet.pk, user)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
         return sheet
-
-
-class AssignStudentSerializer(serializers.Serializer):
-    student = serializers.PrimaryKeyRelatedField(
-        queryset=Student.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-
-    def validate_student(self, value):
-        if value is not None and value.created_by_id != self.context["request"].user.id:
-            raise serializers.ValidationError(
-                "The selected student does not belong to your account."
-            )
-        return value
