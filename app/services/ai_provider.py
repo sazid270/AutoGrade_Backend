@@ -5,11 +5,9 @@ import warnings
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
 
 import requests
 from django.conf import settings
-from django.core.cache import cache
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from filesystem.models.models import ImageModel
@@ -34,92 +32,13 @@ class SheetImageError(Exception):
     pass
 
 
-FREE_VISION_MODELS_CACHE_KEY = "openrouter_free_vision_models"
-
-
-def validate_sheet_reading_config() -> None:
-    if not settings.OPENROUTER_API_KEY.strip():
-        raise ConfigurationError(
-            "Sheet reading is not configured. Set OPENROUTER_API_KEY."
-        )
-
-
-def free_vision_models(*, refresh: bool = False) -> list[str]:
-    if refresh:
-        cache.delete(FREE_VISION_MODELS_CACHE_KEY)
-    else:
-        cached_models = cache.get(FREE_VISION_MODELS_CACHE_KEY)
-        if isinstance(cached_models, list) and all(
-            isinstance(model, str) for model in cached_models
-        ):
-            return cached_models
-
-    try:
-        response = requests.get(
-            f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"},
-            timeout=(5, 20),
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        if status_code == 429 or (status_code is not None and status_code >= 500):
-            raise ProviderTransientError(
-                "The OpenRouter model list is temporarily unavailable.",
-                status_code=status_code,
-            ) from exc
-        raise AIProviderError(
-            "Could not retrieve the OpenRouter model list.",
-            status_code=status_code or 502,
-        ) from exc
-    except requests.RequestException as exc:
-        raise ProviderTransientError(
-            "Could not connect to the OpenRouter model list."
-        ) from exc
-    except ValueError as exc:
-        raise AIProviderError(
-            "The OpenRouter model list returned invalid JSON."
-        ) from exc
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise AIProviderError("The OpenRouter model list has an invalid format.")
-
-    models = set()
-    for item in payload["data"]:
-        if not isinstance(item, dict):
-            continue
-        model_id = item.get("id")
-        architecture = item.get("architecture")
-        if (
-            not isinstance(model_id, str)
-            or not model_id.endswith(":free")
-            or not isinstance(architecture, dict)
-        ):
-            continue
-
-        input_modalities = architecture.get("input_modalities")
-        takes_images = isinstance(input_modalities, list) and any(
-            isinstance(modality, str) and modality.casefold() == "image"
-            for modality in input_modalities
-        )
-        modality = architecture.get("modality")
-        if isinstance(modality, str):
-            input_format = modality.split("->", 1)[0]
-            takes_images = takes_images or any(
-                part.strip().casefold() == "image" for part in input_format.split("+")
-            )
-        if takes_images:
-            models.add(model_id)
-
-    if not models:
-        raise ProviderTransientError(
-            "No free vision-capable OpenRouter models are currently available."
-        )
-
-    available_models = sorted(models)
-    cache.set(FREE_VISION_MODELS_CACHE_KEY, available_models, timeout=3600)
-    return available_models
+def validate_ai_provider_config() -> None:
+    if not settings.COARENA_API_KEY.strip():
+        raise ConfigurationError("AI is not configured. Set COARENA_API_KEY.")
+    if not settings.COARENA_MODEL.strip():
+        raise ConfigurationError("AI is not configured. Set COARENA_MODEL.")
+    if settings.COARENA_MAX_TOKENS < 1:
+        raise ConfigurationError("COARENA_MAX_TOKENS must be a positive integer.")
 
 
 def validate_sheet_image(image: ImageModel) -> None:
@@ -183,20 +102,7 @@ def image_content(image: ImageModel, *, max_edge: int = 1600) -> dict[str, Any]:
         ) from exc
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     url = f"data:image/jpeg;base64,{encoded}"
-    return {"type": "image_url", "image_url": _wrap_url(url)}
-
-
-def _wrap_url(url: str):
-    host = urlparse(settings.OPENROUTER_BASE_URL).hostname
-    return (
-        {"url": url}
-        if host
-        in {
-            "generativelanguage.googleapis.com",
-            "openrouter.ai",
-        }
-        else url
-    )
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
 def array_content(gray, *, quality: int = 85) -> dict[str, Any]:
@@ -211,26 +117,58 @@ def array_content(gray, *, quality: int = 85) -> dict[str, Any]:
         raise AIProviderError("The image could not be encoded.", status_code=400)
     encoded = base64.b64encode(buffer).decode("ascii")
     url = f"data:image/jpeg;base64,{encoded}"
-    return {"type": "image_url", "image_url": _wrap_url(url)}
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
 def output_text(response_data: dict[str, Any]) -> str:
     choices = response_data.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise AIProviderError("The AI provider returned no answer.")
-    message = choices[0].get("message")
+    choice = choices[0]
+    message = choice.get("message")
     if not isinstance(message, dict):
         raise AIProviderError("The AI provider returned an invalid answer.")
+    if choice.get("finish_reason") == "length":
+        raise AIProviderError(
+            "The model ran out of output tokens before answering. "
+            "Increase COARENA_MAX_TOKENS or use a model/effort with less reasoning."
+        )
     content = message.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
     if isinstance(content, list):
-        return "\n".join(
-            item["text"]
-            for item in content
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        text_parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+            elif isinstance(item.get("json"), dict):
+                return json.dumps(item["json"], ensure_ascii=False)
+        if text_parts:
+            return "\n".join(text_parts)
+    parsed = message.get("parsed")
+    if isinstance(parsed, dict):
+        return json.dumps(parsed, ensure_ascii=False)
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        raise AIProviderError("The AI provider refused the request.")
+    if message.get("tool_calls"):
+        raise AIProviderError(
+            "The AI provider returned tool calls instead of an answer."
         )
-    raise AIProviderError("The AI provider returned an invalid answer.")
+    content_type = "null" if content is None else type(content).__name__
+    message_fields = ", ".join(sorted(key for key in message if isinstance(key, str)))
+    finish_reason = choice.get("finish_reason")
+    finish_reason = finish_reason if isinstance(finish_reason, str) else "unknown"
+    raise AIProviderError(
+        "The AI provider returned an unsupported answer format "
+        f"(content type: {content_type}; message fields: {message_fields}; "
+        f"finish reason: {finish_reason})."
+    )
 
 
 def parse_json_object(output_text_value: str) -> dict[str, Any]:
@@ -240,53 +178,76 @@ def parse_json_object(output_text_value: str) -> dict[str, Any]:
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end <= start:
+        decoder = json.JSONDecoder()
+        candidates = []
+        for start, character in enumerate(cleaned):
+            if character != "{":
+                continue
+            try:
+                candidate, end = decoder.raw_decode(cleaned, start)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                candidates.append((end, candidate))
+        if not candidates:
             raise AIProviderError("The AI provider returned invalid JSON.")
-        try:
-            payload = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise AIProviderError("The AI provider returned invalid JSON.") from exc
+        payload = max(candidates, key=lambda item: item[0])[1]
     if not isinstance(payload, dict):
         raise AIProviderError("The AI provider returned an invalid JSON object.")
     return payload
 
 
-def request_ai_provider(content: list[dict[str, Any]], *, model: str) -> dict[str, Any]:
-    validate_sheet_reading_config()
-    api_key = settings.OPENROUTER_API_KEY
+def request_ai_provider(content: list[dict[str, Any]]) -> dict[str, Any]:
+    validate_ai_provider_config()
+    request_data: dict[str, Any] = {
+        "model": settings.COARENA_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": settings.COARENA_MAX_TOKENS,
+    }
+    reasoning_effort = settings.COARENA_REASONING_EFFORT.strip()
+    if reasoning_effort:
+        request_data["reasoning_effort"] = reasoning_effort
     try:
         response = requests.post(
-            f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            f"{settings.COARENA_BASE_URL.rstrip('/')}/chat/completions",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {settings.COARENA_API_KEY}",
             },
-            json={"model": model, "messages": [{"role": "user", "content": content}]},
-            timeout=(5, 60),
+            json=request_data,
+            timeout=(5, 120),
         )
         response.raise_for_status()
         payload = response.json()
     except requests.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
+        if status_code in {401, 403}:
+            raise AIProviderError(
+                "The Coarena API credentials or permissions are invalid.",
+                status_code=502,
+            ) from exc
+        detail = "The Coarena API rejected the request."
+        if exc.response is not None:
+            try:
+                error_payload = exc.response.json()
+            except ValueError:
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    detail = error["message"]
         if status_code in {404, 429} or (
             status_code is not None and status_code >= 500
         ):
             raise ProviderTransientError(
-                "The AI provider is temporarily unavailable or the model is no longer available.",
-                status_code=status_code,
+                detail,
+                status_code=502 if status_code == 404 else status_code or 502,
             ) from exc
-        raise AIProviderError(
-            "The AI provider rejected the sheet-reading request.",
-            status_code=status_code or 502,
-        ) from exc
+        raise AIProviderError(detail, status_code=502) from exc
     except requests.RequestException as exc:
-        raise ProviderTransientError(
-            "Could not connect to the configured AI provider."
-        ) from exc
+        raise ProviderTransientError("Could not connect to the Coarena API.") from exc
     except ValueError as exc:
-        raise AIProviderError("The AI provider returned an invalid response.") from exc
+        raise AIProviderError("Coarena returned an invalid response.") from exc
     if not isinstance(payload, dict):
-        raise AIProviderError("The AI provider returned an invalid response.")
+        raise AIProviderError("Coarena returned an invalid response.")
     return payload

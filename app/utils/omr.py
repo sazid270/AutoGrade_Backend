@@ -159,29 +159,82 @@ def annotate_components(
     return annotated
 
 
-def template_for_component(
-    aligned: np.ndarray, circles: np.ndarray
-) -> dict[str, Any] | None:
-    return template_from_circles(aligned, circles)
+def mask_to_components(
+    aligned: np.ndarray, components: list[np.ndarray], pad: float = 3.0
+) -> np.ndarray:
+    height, width = aligned.shape
+    masked = np.full_like(aligned, 255)
+    for component in components:
+        diameter = float(np.median(component[:, 2]))
+        x0 = max(0, int(component[:, 0].min() - pad * diameter))
+        x1 = min(width, int(component[:, 0].max() + pad * diameter))
+        y0 = max(0, int(component[:, 1].min() - pad * diameter))
+        y1 = min(height, int(component[:, 1].max() + pad * diameter))
+        masked[y0:y1, x0:x1] = aligned[y0:y1, x0:x1]
+    return masked
 
 
 def template_for_components(
-    aligned: np.ndarray, components: list[np.ndarray]
+    aligned: np.ndarray,
+    components: list[np.ndarray],
+    *,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, Any] | None:
     if not components:
+        if diagnostics is not None:
+            diagnostics.append("No answer bubble groups were selected.")
         return None
     circles = np.concatenate(components, axis=0)
-    template = template_from_circles(aligned, circles)
-    if template is None:
-        return None
-    return template
+    diameter = float(np.median(circles[:, 2]))
+    component_centers = np.asarray(
+        [float(np.mean(component[:, 0])) for component in components],
+        dtype=np.float32,
+    )
+    component_columns = _groups(component_centers, 2.7 * diameter)
+    questions = []
+    col_offset = 0
+    for component_indices in component_columns:
+        column_circles = np.concatenate(
+            [components[index] for index in component_indices], axis=0
+        )
+        template = template_from_circles(
+            aligned,
+            column_circles,
+            diagnostics=diagnostics,
+        )
+        if template is None:
+            return None
+        width = max(question["col"] for question in template["questions"]) + 1
+        for question in template["questions"]:
+            question["col"] += col_offset
+            questions.append(question)
+        col_offset += width
+
+    grid_top = int(
+        min(bubble[1] for question in questions for bubble in question["bubbles"])
+        - 1.6 * diameter
+    )
+    grid_bottom = int(
+        max(bubble[1] for question in questions for bubble in question["bubbles"])
+        + 1.6 * diameter
+    )
+    norm = _normalize(aligned)
+    return {
+        "canvas": [CANVAS_W, CANVAS_H],
+        "diameter": round(diameter, 1),
+        "grid_top": grid_top,
+        "grid_bottom": grid_bottom,
+        "ink_top": round(_ink(norm, 0, grid_top), 4),
+        "ink_bottom": round(_ink(norm, grid_bottom, CANVAS_H), 4),
+        "questions": questions,
+    }
 
 
 def digit_columns(circles: np.ndarray) -> list[list[list[float]]] | None:
     diameter = float(np.median(circles[:, 2]))
     if circles[:, 2].max() - circles[:, 2].min() > 0.25 * diameter:
         return None
-    columns = _groups(circles[:, 0], 2.7 * diameter)
+    columns = _groups(circles[:, 0], 0.6 * diameter)
     result = []
     for column in columns:
         bubbles = circles[column]
@@ -200,20 +253,21 @@ def _ink(norm: np.ndarray, y0: int, y1: int) -> float:
     return float((band < 128).mean()) if band.size else 0.0
 
 
-def build_template(aligned: np.ndarray) -> dict[str, Any] | None:
-    circles = _circles(_binary(_normalize(aligned)))
-    return template_from_circles(aligned, circles)
-
-
 def template_from_circles(
-    aligned: np.ndarray, circles: np.ndarray
+    aligned: np.ndarray,
+    circles: np.ndarray,
+    *,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, Any] | None:
+    def reject(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics.append(reason)
+
     if len(circles) < 8:
+        reject(f"Only {len(circles)} bubbles were found; at least 8 are required.")
         return None
     norm = _normalize(aligned)
     diameter = float(np.median(circles[:, 2]))
-    if circles[:, 2].max() - circles[:, 2].min() > 0.25 * diameter:
-        return None
     columns = _groups(circles[:, 0], 2.7 * diameter)
     rows = []
     for column_index, column in enumerate(columns):
@@ -226,6 +280,18 @@ def template_from_circles(
         ):
             bubbles = sub[row][np.argsort(sub[row][:, 0])]
             if not 2 <= len(bubbles) <= 10:
+                reject(
+                    f"Column group {column_index + 1}, row group {row_index + 1} "
+                    f"contains {len(bubbles)} bubbles; expected 2 through 10."
+                )
+                return None
+            row_diameter = float(np.median(bubbles[:, 2]))
+            row_diameter_spread = float(bubbles[:, 2].max() - bubbles[:, 2].min())
+            if row_diameter_spread > 0.25 * row_diameter:
+                reject(
+                    f"Column group {column_index + 1}, row group {row_index + 1} "
+                    "has inconsistent bubble diameters."
+                )
                 return None
             rows.append(
                 {
@@ -278,20 +344,36 @@ def read_bubble_groups(
     diameter: float,
 ) -> tuple[list[list[float]], float]:
     norm = _normalize(aligned)
-    d = diameter
-    half = int(math.ceil(d * 0.95))
-    yy, xx = np.mgrid[-half : half + 1, -half : half + 1]
-    radius = np.sqrt(xx**2 + yy**2)
-    inner, ring = radius <= 0.35 * d, (radius >= 0.44 * d) & (radius <= 0.58 * d)
-    around = (radius >= 0.75 * d) & (radius <= 0.95 * d)
+    masks_by_diameter: dict[float, tuple[int, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def masks_for(
+        bubble_diameter: float,
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+        key = round(bubble_diameter, 1)
+        if key not in masks_by_diameter:
+            diameter = key
+            half = int(math.ceil(diameter * 0.95))
+            yy, xx = np.mgrid[-half : half + 1, -half : half + 1]
+            radius = np.sqrt(xx**2 + yy**2)
+            masks_by_diameter[key] = (
+                half,
+                radius <= 0.35 * diameter,
+                (radius >= 0.44 * diameter) & (radius <= 0.58 * diameter),
+                (radius >= 0.75 * diameter) & (radius <= 0.95 * diameter),
+            )
+        return masks_by_diameter[key]
+
     values, fitting, total = [], 0, 0
     for group in groups:
         row = []
-        for cx, cy, _ in group:
+        for cx, cy, bubble_diameter in group:
+            bubble_diameter = bubble_diameter or diameter
+            half, inner, ring, around = masks_for(bubble_diameter)
+            radius_shape = inner.shape
             x0, y0 = int(round(cx)) - half, int(round(cy)) - half
-            roi = norm[y0 : y0 + 2 * half + 1, x0 : x0 + 2 * half + 1]
+            roi = norm[y0 : y0 + radius_shape[0], x0 : x0 + radius_shape[1]]
             total += 1
-            if x0 < 0 or y0 < 0 or roi.shape != radius.shape:
+            if x0 < 0 or y0 < 0 or roi.shape != radius_shape:
                 row.append(0.0)
                 continue
             dark = 1 - roi.astype(np.float32) / 255
@@ -311,10 +393,6 @@ def decode_marks(values: list[list[float]], *, mark=0.2, faint=0.1, relative=0.6
     return selected, unclear
 
 
-def header_crop(aligned: np.ndarray, template: dict[str, Any]) -> np.ndarray:
-    return aligned[: template["grid_top"]]
-
-
 def question_order(template: dict[str, Any], numbering: str = "column") -> list[int]:
     rows = template["questions"]
     if numbering == "column":
@@ -328,32 +406,6 @@ def answers_by_number(
     order = question_order(template, numbering)
     selected, unclear = decode_marks([values[i] for i in order])
     return {
-        n + 1: ([chr(65 + i) for i in sel], flag or len(sel) > 1)
+        n + 1: ([chr(65 + i) for i in sel], flag)
         for n, (sel, flag) in enumerate(zip(selected, unclear))
     }
-
-
-def pick_numbering(
-    aligned, template, ai_answers, ai_unclear, option_counts, *, minimum=0.9
-):
-    if len(template["questions"]) != len(option_counts):
-        return None
-    values, fit = read_marks(aligned, template)
-    if fit < MIN_FIT:
-        return None
-    best, best_score = None, 0.0
-    for numbering in ("column", "row"):
-        order = question_order(template, numbering)
-        if any(
-            len(template["questions"][row]["bubbles"]) != option_counts.get(n + 1)
-            for n, row in enumerate(order)
-        ):
-            continue
-        read = answers_by_number(values, template, numbering)
-        usable = [n for n in read if n not in ai_unclear]
-        if not usable:
-            continue
-        score = sum(read[n][0] == ai_answers.get(n, []) for n in usable) / len(usable)
-        if score > best_score:
-            best, best_score = numbering, score
-    return best if best_score >= minimum else None

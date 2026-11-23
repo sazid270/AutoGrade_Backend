@@ -136,6 +136,7 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
     questions = list(exam.questions.order_by("pk"))
     question_numbers = list(range(1, len(questions) + 1))
     started = time.monotonic()
+    layout_error = ""
     try:
         if initial.batch.template_id is None:
             raise TemplateMismatch("No OMR template is assigned to this batch.")
@@ -143,14 +144,18 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             initial,
             initial.batch.template.structure,
             question_numbers,
+            multi_allowed={
+                number: question.allow_multiple
+                for number, question in enumerate(questions, start=1)
+            },
         )
     except TemplateMismatch as exc:
-        logger.info("Sheet %s requires review: %s", sheet_id, exc)
+        layout_error = str(exc)
+        logger.info("Sheet %s requires review: %s", sheet_id, layout_error)
         read = {
             "answers": {number: [] for number in question_numbers},
-            "unclear": question_numbers,
-            "unclear_fields": {"roll"},
-            "invalid": True,
+            "unclear": [],
+            "unclear_fields": set(),
             "name": "",
             "roll": "",
             "registration": "",
@@ -164,15 +169,16 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
         sheet_id,
         time.monotonic() - started,
     )
-    reasons = [
-        {"field": "answer", "question_number": number} for number in read["unclear"]
-    ]
-    if read["invalid"]:
-        reasons.append({"field": "layout_mismatch"})
-    if sum(1 for options in read["answers"].values() if not options) * 2 > len(
-        question_numbers
-    ):
-        reasons.append({"field": "many_blank_answers"})
+    if layout_error:
+        reasons = [{"field": "layout_mismatch", "detail": layout_error}]
+    else:
+        reasons = [
+            {"field": "answer", "question_number": number} for number in read["unclear"]
+        ]
+        if sum(1 for options in read["answers"].values() if not options) * 2 > len(
+            question_numbers
+        ):
+            reasons.append({"field": "many_blank_answers"})
     unclear = read["unclear_fields"]
     exam_section = normalize_section(exam.section)
     sheet_section = normalize_section(read["section"]) or normalize_section(

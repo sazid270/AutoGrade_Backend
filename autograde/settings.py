@@ -212,15 +212,19 @@ OTP_MAX_ATTEMPTS = env("OTP_MAX_ATTEMPTS", cast=int, default=5)
 OTP_RESEND_COOLDOWN_TIME = env("OTP_RESEND_COOLDOWN_TIME", cast=int, default=1)
 GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", default="")
 
-# OpenRouter settings
-OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", default="")
-OPENROUTER_BASE_URL = env("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
-OPENROUTER_ANSWER_MODEL = env("OPENROUTER_ANSWER_MODEL", default="openrouter/free")
+# Coarena settings
+COARENA_API_KEY = env("COARENA_API_KEY", default="")
+COARENA_BASE_URL = env("COARENA_BASE_URL", default="https://coarena.ai/api/v1")
+COARENA_MODEL = env("COARENA_MODEL", default="deepseek-v4-1-flash-1017")
+COARENA_MAX_TOKENS = env("COARENA_MAX_TOKENS", cast=int, default=16384)
+COARENA_REASONING_EFFORT = env("COARENA_REASONING_EFFORT", default="")
 
 REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
     "otp_request": "10/hour",
     "otp_verify": "30/hour",
     "google_auth": "30/hour",
+    "sheet_template": "10/hour",
+    "answers_extract": "30/hour",
 }
 
 # Email settings

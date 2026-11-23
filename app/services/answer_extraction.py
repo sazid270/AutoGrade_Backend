@@ -1,7 +1,5 @@
 from typing import Any
 
-from django.conf import settings
-
 from app.services.ai_provider import (
     AIProviderError,
     image_content,
@@ -36,8 +34,7 @@ def extract_answers_from_image(image: ImageModel) -> list[dict[str, Any]]:
     )
     validate_sheet_image(image)
     response_data = request_ai_provider(
-        [{"type": "text", "text": prompt}, image_content(image)],
-        model=settings.OPENROUTER_ANSWER_MODEL,
+        [{"type": "text", "text": prompt}, image_content(image)]
     )
     answers = parse_json_object(output_text(response_data)).get("answers")
     if not isinstance(answers, list):

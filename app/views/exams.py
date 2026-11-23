@@ -6,6 +6,7 @@ from drf_yasg.utils import swagger_auto_schema
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
 from app.models.exams import Answer, Exam, Question
 from app.serializers.exams import (
@@ -33,6 +34,7 @@ class ExamView(viewsets.ModelViewSet):
     serializer_class = ExamSerializer
     http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_exams"]
+    throttle_scope = None
     filter_backends = (DjangoFilterBackend, filters.SearchFilter)
     filterset_fields = (
         "subject",
@@ -137,7 +139,13 @@ class ExamView(viewsets.ModelViewSet):
         request_body=AnswerImageExtractionRequestSerializer,
         responses={200: AnswerExtractionResponseSerializer},
     )
-    @action(detail=True, methods=("post",), url_path="answers/extract")
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="answers/extract",
+        throttle_classes=[ScopedRateThrottle],
+        throttle_scope="answers_extract",
+    )
     def extract_answers(self, request, **kwargs):
         exam = self._get_exam_for_action(request, kwargs)
         if exam.exam_type != Exam.Type.MCQ:

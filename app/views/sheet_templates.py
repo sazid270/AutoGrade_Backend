@@ -5,8 +5,9 @@ from django.db.models import ProtectedError
 from drf_yasg.utils import swagger_auto_schema
 from rest_framework import status, viewsets
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
-from app.models.scanning import SheetTemplate
+from app.models.sheet_templates import SheetTemplate
 from app.serializers.sheet_templates import (
     SheetTemplateCreateSerializer,
     SheetTemplatePatchSerializer,
@@ -30,13 +31,24 @@ class SheetTemplateViewSet(viewsets.ModelViewSet):
     serializer_class = SheetTemplateSerializer
     http_method_names = ["get", "post", "patch", "delete"]
     swagger_tags = ["app_sheet_templates"]
+    throttle_scope = "sheet_template"
+
+    def get_throttles(self):
+        uses_ai = self.action == "create" or (
+            self.action == "partial_update" and "image_id" in self.request.data
+        )
+        if uses_ai:
+            return [*super().get_throttles(), ScopedRateThrottle()]
+        return super().get_throttles()
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return SheetTemplate.objects.none()
-        return SheetTemplate.objects.filter(
-            created_by=self.request.user
-        ).select_related("reference_image")
+        return (
+            SheetTemplate.objects.filter(created_by=self.request.user)
+            .select_related("reference_image")
+            .order_by("-created_at")
+        )
 
     @swagger_auto_schema(
         request_body=SheetTemplateCreateSerializer,
@@ -171,7 +183,7 @@ class SheetTemplateViewSet(viewsets.ModelViewSet):
         template = SheetTemplate.objects.select_for_update().get(pk=template.pk)
         if template.batches.exists():
             return Response(
-                {"detail": "A template used by a batch cannot be deleted."},
+                {"detail": "The template is still in use."},
                 status=status.HTTP_409_CONFLICT,
             )
         try:

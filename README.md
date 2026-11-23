@@ -17,6 +17,7 @@ AutoGrade is a print-on-demand store that transforms creativity into high-qualit
 - [Background Worker (Celery & Redis)](docs/CELERY.md)
 - [Scheduled Tasks (Cronjobs)](docs/CRONJOBS.md)
 - [Dependency checker (Deptry)](docs/DEPTRY.md)
+- [Sheet templates](docs/SHEET_TEMPLATES.md)
 
 ## Tech Stack
 

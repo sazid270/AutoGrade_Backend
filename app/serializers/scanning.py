@@ -2,7 +2,8 @@ from django.db import transaction
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
 
-from app.models.scanning import AnswerSheet, ScanBatch, SheetTemplate, StudentAnswer
+from app.models.scanning import AnswerSheet, ScanBatch, StudentAnswer
+from app.models.sheet_templates import SheetTemplate
 from app.services.grading import validate_exam_ready
 from app.utils.options import normalize_options
 from filesystem.models.models import ImageModel

@@ -1,11 +1,12 @@
 from rest_framework import serializers
 
-from app.models.scanning import SheetTemplate
+from app.models.sheet_templates import SheetTemplate
 from filesystem.models.models import ImageModel
 
 
 class SheetTemplateSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
+    image_id = serializers.IntegerField(source="reference_image_id", read_only=True)
     structure_summary = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
 
@@ -14,6 +15,7 @@ class SheetTemplateSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "name",
+            "image_id",
             "image_url",
             "structure_summary",
             "status",

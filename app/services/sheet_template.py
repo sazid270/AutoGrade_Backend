@@ -1,7 +1,6 @@
 from typing import Any
 
 import numpy as np
-from django.conf import settings
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.services.ai_provider import (
@@ -67,28 +66,31 @@ def _label_components(aligned: np.ndarray, components: list[np.ndarray]) -> dict
         '"grid_id", "role" (answers, roll, registration, or ignore), "numbering" '
         '(column or row for answers), and "digit_order" (the ten digits from top to '
         "bottom for roll/registration). For the answer grid, return option_labels as "
-        "one array per question in printed question order, with each question's labels "
-        "from left to right. Only identify a group as roll/registration if "
+        "one array per question in printed question order, with one label per visible "
+        "bubble, from left to right. Count the visible bubbles separately for every "
+        "question; do not assume all questions have the same number of options. "
+        "Only identify a group as roll/registration if "
         "it is a 10-choice digit bubble grid. A digit_order must contain each of "
         '0 through 9 exactly once. Example: {"grids":[{"grid_id":1,"role":"answers",'
         '"numbering":"column"},{"grid_id":2,"role":"roll","digit_order":'
         '["0","1","2","3","4","5","6","7","8","9"]}],"question_count":2,'
-        '"options_per_question":[4,4],"option_labels":[["A","B","C","D"],'
-        '["A","B","C","D"]],"roll_digit_count":6,"registration_digit_count":null}'
+        '"options_per_question":[4,2],"option_labels":[["A","B","C","D"],'
+        '["A","B"]],"roll_digit_count":6,"registration_digit_count":null}'
+        " Output exactly one valid JSON object, with no prose or markdown."
     )
-    image = omr.annotate_components(aligned, components)
+    masked = omr.mask_to_components(aligned, components)
+    image = omr.annotate_components(masked, components)
     response = request_ai_provider(
         [
             {"type": "text", "text": prompt + f"\nDetected groups: {candidates}"},
             array_content(image, quality=90),
-        ],
-        model=settings.OPENROUTER_ANSWER_MODEL,
+        ]
     )
     try:
         payload = parse_json_object(output_text(response))
     except AIProviderError as exc:
         raise TemplateExtractionError(
-            "The AI could not return a valid grid classification."
+            f"The AI could not return a valid grid classification: {exc.detail}"
         ) from exc
     if not isinstance(payload.get("grids"), list):
         raise TemplateExtractionError("The AI did not return a grid classification.")
@@ -158,13 +160,20 @@ def extract_template(image) -> dict[str, Any]:
     numbering = next(iter(numberings)) if len(numberings) == 1 else None
     if numbering not in {"column", "row"}:
         raise TemplateExtractionError("The answer-grid numbering is unclear.")
+    geometry_diagnostics: list[str] = []
     answers = omr.template_for_components(
         aligned,
         [components[grid_id - 1] for grid_id, _ in roles["answers"]],
+        diagnostics=geometry_diagnostics,
     )
     if answers is None:
+        detail = (
+            geometry_diagnostics[0]
+            if geometry_diagnostics
+            else "The detected bubbles do not form a supported grid."
+        )
         raise TemplateExtractionError(
-            "The answer grid could not be verified geometrically."
+            f"The answer grid could not be verified geometrically: {detail}"
         )
     order = omr.question_order(answers, numbering)
     options_per_question = [len(answers["questions"][row]["bubbles"]) for row in order]
@@ -173,13 +182,34 @@ def extract_template(image) -> dict[str, Any]:
     ):
         raise TemplateExtractionError("The detected answer grid is incomplete.")
     question_count = classification.get("question_count")
-    if (
-        type(question_count) is not int
-        or question_count != len(options_per_question)
-        or classification.get("options_per_question") != options_per_question
+    if type(question_count) is not int:
+        raise TemplateExtractionError(
+            "The AI returned an invalid question count; "
+            f"OpenCV detected {len(options_per_question)} questions."
+        )
+    if question_count != len(options_per_question):
+        reported_options = classification.get("options_per_question")
+        if not isinstance(reported_options, list) or any(
+            type(count) is not int for count in reported_options
+        ):
+            reported_options = "invalid"
+        raise TemplateExtractionError(
+            f"The AI reported {question_count} questions; "
+            f"OpenCV detected {len(options_per_question)}. "
+            f"Options per question: AI={reported_options}, "
+            f"OpenCV={options_per_question}."
+        )
+    reported_options = classification.get("options_per_question")
+    if not isinstance(reported_options, list) or any(
+        type(count) is not int for count in reported_options
     ):
         raise TemplateExtractionError(
-            "The AI's answer-grid counts do not match the detected bubbles."
+            "The AI returned invalid options-per-question counts."
+        )
+    if reported_options != options_per_question:
+        raise TemplateExtractionError(
+            f"The AI reported {reported_options} options per question; "
+            f"OpenCV detected {options_per_question}."
         )
     raw_option_labels = classification.get("option_labels")
     if not isinstance(raw_option_labels, list) or len(raw_option_labels) != len(order):
@@ -234,17 +264,16 @@ def extract_template(image) -> dict[str, Any]:
             raise TemplateExtractionError(
                 f"The {field_name} grid does not contain ten bubbles per digit."
             )
-        field["required"] = True
+        field["required"] = field_name == "roll"
         expected_count = classification.get(f"{field_name}_digit_count")
         if type(expected_count) is not int or expected_count != len(field["digits"]):
             raise TemplateExtractionError(
                 f"The AI's {field_name} digit count does not match the detected grid."
             )
         fields[field_name] = field
-    if (
-        not roles["registration"]
-        and classification.get("registration_digit_count") is not None
-    ):
+    if not roles["registration"] and classification.get(
+        "registration_digit_count"
+    ) not in (None, 0):
         raise TemplateExtractionError(
             "The AI identified a registration grid that was not detected."
         )
@@ -275,6 +304,8 @@ def _read_digits(aligned: np.ndarray, field: dict[str, Any]) -> tuple[str | None
     if fit < omr.MIN_FIT:
         raise TemplateMismatch(f"Digit-grid fit was below threshold ({fit:.0%}).")
     selected, unclear = omr.decode_marks(values)
+    if not field.get("required", True) and not any(selected) and not any(unclear):
+        return "", False
     result = []
     for choices, bad in zip(selected, unclear):
         if bad or len(choices) != 1:
@@ -283,7 +314,12 @@ def _read_digits(aligned: np.ndarray, field: dict[str, Any]) -> tuple[str | None
     return "".join(result), False
 
 
-def read_with_template(sheet, structure: dict[str, Any], question_numbers: list[int]):
+def read_with_template(
+    sheet,
+    structure: dict[str, Any],
+    question_numbers: list[int],
+    multi_allowed: dict[int, bool],
+):
     aligned = omr.align_page(load_gray(sheet.image))
     if aligned is None:
         raise TemplateMismatch("Four corner markers were not found.")
@@ -294,24 +330,30 @@ def read_with_template(sheet, structure: dict[str, Any], question_numbers: list[
         raise TemplateMismatch(f"Answer-grid fit was below threshold ({fit:.0%}).")
     marks = omr.answers_by_number(values, answers_template, structure["numbering"])
     order = omr.question_order(answers_template, structure["numbering"])
-    answers = {
-        number: [
-            structure["option_labels_by_row"][order[number - 1]][ord(label) - 65]
-            for label in marks[number][0]
-        ]
-        for number in question_numbers
-    }
-    unclear = {
-        number
-        for number in question_numbers
-        if marks[number][1] or len(marks[number][0]) > 1
-    }
+    try:
+        answers = {
+            number: [
+                structure["option_labels_by_row"][order[number - 1]][ord(label) - 65]
+                for label in marks[number][0]
+            ]
+            for number in question_numbers
+        }
+        unclear = {
+            number
+            for number in question_numbers
+            if marks[number][1]
+            or (len(marks[number][0]) > 1 and not multi_allowed.get(number, False))
+        }
+    except (KeyError, IndexError) as exc:
+        raise TemplateMismatch(
+            "The template does not contain every requested question."
+        ) from exc
     identity = {}
     unclear_fields = set()
     for field_name, field in structure["fields"].items():
         value, bad = _read_digits(aligned, field)
         identity[field_name] = value or ""
-        if bad and field.get("required", True):
+        if bad:
             unclear_fields.add(field_name)
     return {
         "answers": answers,
