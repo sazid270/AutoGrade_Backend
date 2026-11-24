@@ -25,7 +25,7 @@ from app.services.ai_provider import (
     SheetImageError,
 )
 from app.services.answer_extraction import extract_answers_from_image
-from app.services.answers import ensure_exam_questions
+from app.services.answers import ensure_exam_question
 from app.utils.options import BENGALI_DIGITS, normalize_options
 
 
@@ -69,7 +69,7 @@ class ExamView(viewsets.ModelViewSet):
             )
             self.check_object_permissions(request, exam)
             if (
-                exam.questions.exists()
+                Question.objects.filter(exam=exam).exists()
                 or exam.answers.exists()
                 or exam.batches.exists()
                 or exam.results.exists()
@@ -217,26 +217,22 @@ class ExamView(viewsets.ModelViewSet):
         conflicts = []
         with transaction.atomic():
             exam = Exam.objects.select_for_update().get(pk=exam.pk)
-            questions = list(exam.questions.select_for_update().order_by("pk"))
-            locked = exam.batches.exists()
+            question = Question.objects.select_for_update().filter(exam=exam).first()
             accepted_answers = []
             for extracted_answer in sorted(
                 answers, key=lambda item: item["question_number"]
             ):
                 number = extracted_answer["question_number"]
                 options = extracted_answer["correct_options"]
-                if number > len(questions) and locked:
+                if number > exam.question_count:
                     invalid_answers.append(
                         {
                             "question_number": number,
-                            "reason": (
-                                "Questions cannot be added after scanning begins."
-                            ),
+                            "reason": "Question number exceeds exam question_count.",
                         }
                     )
                     continue
-                if number <= len(questions):
-                    question = questions[number - 1]
+                if question is not None:
                     allowed = {
                         chr(ord("A") + index) for index in range(question.options_count)
                     }
@@ -254,17 +250,17 @@ class ExamView(viewsets.ModelViewSet):
                         continue
                 accepted_answers.append(extracted_answer)
 
-            questions = ensure_exam_questions(
-                exam,
-                {
-                    item["question_number"]: item["correct_options"]
-                    for item in accepted_answers
-                },
-            )
+            if accepted_answers:
+                ensure_exam_question(
+                    exam,
+                    {
+                        item["question_number"]: item["correct_options"]
+                        for item in accepted_answers
+                    },
+                )
             for extracted_answer in accepted_answers:
                 number = extracted_answer["question_number"]
                 options = extracted_answer["correct_options"]
-                question = questions[number - 1]
                 answer = (
                     Answer.objects.select_for_update()
                     .filter(exam=exam, question_number=number)
@@ -274,21 +270,18 @@ class ExamView(viewsets.ModelViewSet):
                     answer = Answer.objects.create(
                         exam=exam,
                         question_number=number,
-                        question=question,
                         correct_options=options,
                         source=Answer.Source.SCANNED,
                         needs_review=True,
                         updated_by=request.user,
                     )
                 elif answer.needs_review:
-                    answer.question = question
                     answer.correct_options = options
                     answer.source = Answer.Source.SCANNED
                     answer.confidence = None
                     answer.updated_by = request.user
                     answer.save(
                         update_fields=(
-                            "question",
                             "correct_options",
                             "source",
                             "confidence",
@@ -365,7 +358,7 @@ class QuestionView(viewsets.ModelViewSet):
                 {"detail": "Questions cannot be deleted after scanning begins."},
                 status=status.HTTP_409_CONFLICT,
             )
-        if Answer.objects.filter(question=question).exists():
+        if Answer.objects.filter(exam=exam).exists():
             return Response(
                 {"detail": "Questions with saved answers cannot be deleted."},
                 status=status.HTTP_409_CONFLICT,

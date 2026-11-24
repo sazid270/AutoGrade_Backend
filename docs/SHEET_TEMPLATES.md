@@ -6,8 +6,17 @@ without an AI call per sheet.
 1. Upload a reference image with `POST /api/file/image/`. Prefer a blank sheet.
 2. Create a template with `POST /api/app/sheet-templates/`, sending `name` and
    `image_id`.
-3. Pass the template's `id` as `template` when creating a batch with
+3. Set `question_count` on the exam and create one question-paper resource for
+   it. The paper's option count and multiple-answer setting apply to every MCQ
+   in the exam; answer keys are identified by `question_number`.
+4. Pass the template's `id` as `template` when creating a batch with
    `POST /api/app/answer-sheet-batch/`.
+
+The exam's `question_count` is explicit and is not inferred from `marks` or
+`mcq_mark`. Existing question images are merged into the retained question
+paper during migration. When older per-question settings differ, the migration
+uses the largest `options_count` and enables multiple answers if any old
+question allowed them.
 
 The sheet needs four corner markers, an answer grid, and a roll-number digit
 grid with ten bubbles per digit. A registration grid is optional. Templates

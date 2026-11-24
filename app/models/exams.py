@@ -30,6 +30,10 @@ class Exam(TimeStampMixin):
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
     )
+    question_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of questions on this exam's question paper.",
+    )
     mcq_mark = models.DecimalField(
         max_digits=5,
         decimal_places=2,
@@ -63,7 +67,11 @@ class Exam(TimeStampMixin):
 
 # Question models
 class Question(models.Model):
-    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="questions")
+    exam = models.OneToOneField(
+        Exam,
+        on_delete=models.CASCADE,
+        related_name="question",
+    )
     question_images = models.ManyToManyField(
         ImageModel,
         related_name="question_images",
@@ -75,7 +83,7 @@ class Question(models.Model):
     allow_multiple = models.BooleanField(default=False)
 
     def __str__(self):
-        return f"{self.exam.title} - Question sheet {self.pk}"
+        return f"{self.exam.title} - Question paper"
 
 
 # Answer models
@@ -85,9 +93,6 @@ class Answer(models.Model):
         SCANNED = "scanned", "Scanned"
         MANUAL_EDIT = "manual_edit", "Manual edit"
 
-    question = models.OneToOneField(
-        Question, on_delete=models.CASCADE, related_name="answer"
-    )
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name="answers")
     question_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     correct_options = models.JSONField(default=list)

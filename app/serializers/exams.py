@@ -2,7 +2,7 @@ from django.db import transaction
 from rest_framework import serializers
 
 from app.models.exams import Answer, Exam, Question
-from app.services.answers import ensure_exam_questions
+from app.services.answers import ensure_exam_question
 from app.utils.options import normalize_options
 from filesystem.models.models import ImageModel
 
@@ -74,7 +74,10 @@ class ExamSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         instance = Exam.objects.select_for_update().get(pk=instance.pk)
         if (
-            instance.questions.exists()
+            (
+                Question.objects.filter(exam=instance).exists()
+                or instance.answers.exists()
+            )
             and "exam_type" in validated_data
             and validated_data["exam_type"] != instance.exam_type
         ):
@@ -88,6 +91,7 @@ class ExamSerializer(serializers.ModelSerializer):
             "exam_year",
             "exam_type",
             "marks",
+            "question_count",
             "mcq_mark",
             "negative_marks",
         )
@@ -98,6 +102,14 @@ class ExamSerializer(serializers.ModelSerializer):
         ):
             raise serializers.ValidationError(
                 "Exam identity fields cannot change after scanning begins."
+            )
+        if (
+            "question_count" in validated_data
+            and validated_data["question_count"] != instance.question_count
+            and instance.answers.exists()
+        ):
+            raise serializers.ValidationError(
+                "Question count cannot change after answers have been entered."
             )
         return super().update(instance, validated_data)
 
@@ -218,22 +230,20 @@ class QuestionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     "Question fields cannot change after scanning begins."
                 )
-            if image_changed and getattr(question, "answer", None):
+            answers = Answer.objects.filter(exam=question.exam)
+            if image_changed and answers.exists():
                 raise serializers.ValidationError(
                     "Question images cannot change after answers are entered."
                 )
-        if question is not None:
-            key = getattr(question, "answer", None)
-            if key and question.exam.exam_type == Exam.Type.MCQ:
+            if answers.exists() and question.exam.exam_type == Exam.Type.MCQ:
                 options_count = attrs.get("options_count", question.options_count)
                 allow_multiple = attrs.get("allow_multiple", question.allow_multiple)
-                options = key.correct_options
                 allowed = {chr(ord("A") + index) for index in range(options_count)}
-                if not set(options).issubset(allowed):
-                    raise serializers.ValidationError(
-                        "Question changes would invalidate its answer key."
-                    )
-                if not allow_multiple and len(options) > 1:
+                if any(
+                    not set(answer.correct_options).issubset(allowed)
+                    or (not allow_multiple and len(answer.correct_options) > 1)
+                    for answer in answers
+                ):
                     raise serializers.ValidationError(
                         "Question changes would invalidate its answer key."
                     )
@@ -242,9 +252,14 @@ class QuestionSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         exam = Exam.objects.select_for_update().get(pk=validated_data["exam"].pk)
-        if exam.batches.exists() or Answer.objects.filter(exam=exam).exists():
+        if (
+            Question.objects.filter(exam=exam).exists()
+            or exam.batches.exists()
+            or Answer.objects.filter(exam=exam).exists()
+        ):
             raise serializers.ValidationError(
-                "Questions cannot be added after scanning or answers have started."
+                "An exam can have only one question paper, and it cannot be added "
+                "after scanning or answers have started."
             )
         validated_data["exam"] = exam
         return super().create(validated_data)
@@ -258,7 +273,7 @@ class QuestionSerializer(serializers.ModelSerializer):
             image.pk for image in new_images
         } != set(instance.question_images.values_list("pk", flat=True))
         if images_changed and (
-            exam.batches.exists() or Answer.objects.filter(question=instance).exists()
+            exam.batches.exists() or Answer.objects.filter(exam=exam).exists()
         ):
             raise serializers.ValidationError(
                 "Question images cannot change after answers are entered "
@@ -294,15 +309,18 @@ class ExamAnswerSetSerializer(serializers.Serializer):
                 {"answers": "Each question_number can appear only once."}
             )
 
-        questions = list(exam.questions.order_by("pk"))
+        question = Question.objects.filter(exam=exam).first()
+        if exam.question_count < 1:
+            raise serializers.ValidationError(
+                {"answers": "Set a positive question_count on the exam first."}
+            )
         normalized_answers = []
         for item in attrs["answers"]:
             question_number = item["question_number"]
-            question = (
-                questions[question_number - 1]
-                if question_number <= len(questions)
-                else None
-            )
+            if question_number > exam.question_count:
+                raise serializers.ValidationError(
+                    {"answers": f"Question {question_number} exceeds question_count."}
+                )
             options, bad = normalize_options(item["correct_options"])
             if bad or not options:
                 raise serializers.ValidationError(
@@ -345,27 +363,33 @@ class ExamAnswerSetSerializer(serializers.Serializer):
     def create(self, validated_data):
         exam = Exam.objects.select_for_update().get(pk=self.context["exam"].pk)
         user = self.context["request"].user
-        question_count = exam.questions.count()
-        if exam.batches.exists() and any(
-            question_number > question_count
-            for question_number, _ in validated_data["normalized_answers"]
+        normalized_answers = validated_data["normalized_answers"]
+        if any(
+            question_number > exam.question_count
+            for question_number, _ in normalized_answers
         ):
             raise serializers.ValidationError(
-                "Questions cannot be added after scanning begins."
+                "One or more answers exceed the exam question_count."
             )
-        questions = ensure_exam_questions(
-            exam,
-            dict(validated_data["normalized_answers"]),
-        )
+        question = Question.objects.select_for_update().filter(exam=exam).first()
+        if question is not None:
+            allowed = {chr(ord("A") + index) for index in range(question.options_count)}
+            if any(
+                not set(options).issubset(allowed)
+                or (not question.allow_multiple and len(options) > 1)
+                for _, options in normalized_answers
+            ):
+                raise serializers.ValidationError(
+                    "One or more answers do not fit the exam question settings."
+                )
+        ensure_exam_question(exam, dict(normalized_answers))
         entries = []
         any_changed = False
-        for question_number, options in validated_data["normalized_answers"]:
-            question = questions[question_number - 1]
+        for question_number, options in normalized_answers:
             answer, created = Answer.objects.select_for_update().get_or_create(
                 exam=exam,
                 question_number=question_number,
                 defaults={
-                    "question": question,
                     "correct_options": options,
                     "source": Answer.Source.MANUAL,
                     "needs_review": False,
@@ -375,20 +399,16 @@ class ExamAnswerSetSerializer(serializers.Serializer):
             any_changed = any_changed or created
             if not created:
                 changed = (
-                    sorted(answer.correct_options) != options
-                    or answer.needs_review
-                    or answer.question_id != question.pk
+                    sorted(answer.correct_options) != options or answer.needs_review
                 )
                 if changed:
                     any_changed = True
-                    answer.question = question
                     answer.correct_options = options
                     answer.source = Answer.Source.MANUAL_EDIT
                     answer.needs_review = False
                     answer.updated_by = user
                     answer.save(
                         update_fields=(
-                            "question",
                             "correct_options",
                             "source",
                             "needs_review",
@@ -421,7 +441,6 @@ class AnswerImageExtractionRequestSerializer(serializers.Serializer):
 class SavedAnswerSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     exam = serializers.IntegerField(source="exam_id")
-    question = serializers.IntegerField(source="question_id")
     question_number = serializers.IntegerField()
     correct_options = serializers.ListField(child=serializers.CharField())
     source = serializers.ChoiceField(choices=Answer.Source.choices, allow_null=True)

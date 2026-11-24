@@ -2,6 +2,7 @@ from django.db import transaction
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
 
+from app.models.exams import Exam, Question
 from app.models.scanning import AnswerSheet, ScanBatch, StudentAnswer
 from app.models.sheet_templates import SheetTemplate
 from app.services.grading import validate_exam_ready
@@ -60,17 +61,20 @@ class AnswerSheetBatchSerializer(serializers.ModelSerializer):
             return attrs
         exam = attrs["exam"]
         structure = attrs["template"].structure
-        questions = list(exam.questions.order_by("pk"))
+        question = Question.objects.filter(exam=exam).first()
         options = structure.get("options_per_question")
-        if not isinstance(options, list) or len(options) != len(questions):
+        if not isinstance(options, list) or len(options) != exam.question_count:
             raise serializers.ValidationError(
                 {"template": ("The template question count does not match the exam.")}
             )
-        if options != [question.options_count for question in questions]:
+        if (
+            question is None
+            or options != [question.options_count] * exam.question_count
+        ):
             raise serializers.ValidationError(
                 {
                     "template": (
-                        "The template option counts do not match the exam questions."
+                        "The template option counts do not match the exam settings."
                     )
                 }
             )
@@ -101,17 +105,22 @@ class AnswerSheetBatchSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
+        exam = Exam.objects.select_for_update().get(pk=validated_data["exam"].pk)
+        question = Question.objects.select_for_update().filter(exam=exam).first()
         template = SheetTemplate.objects.select_for_update().get(
             pk=validated_data["template"].pk
         )
-        questions = list(validated_data["exam"].questions.order_by("pk"))
         options = template.structure.get("options_per_question")
-        if not isinstance(options, list) or options != [
-            question.options_count for question in questions
-        ]:
+        if (
+            not isinstance(options, list)
+            or len(options) != exam.question_count
+            or question is None
+            or options != [question.options_count] * exam.question_count
+        ):
             raise serializers.ValidationError(
-                {"template": "The template no longer matches the exam questions."}
+                {"template": "The template no longer matches the exam settings."}
             )
+        validated_data["exam"] = exam
         validated_data["template"] = template
         validated_data.pop("image_ids")
         images = validated_data.pop("images")
@@ -188,11 +197,16 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
     def validate_answers(self, value):
         if self.instance is None:
             raise serializers.ValidationError("Answers can only be updated on a sheet.")
-        questions = self.instance.batch.exam.questions.order_by("pk")
-        counts = {
-            number: question.options_count
-            for number, question in enumerate(questions, start=1)
-        }
+        exam = self.instance.batch.exam
+        question = Question.objects.filter(exam=exam).first()
+        counts = (
+            {
+                number: question.options_count
+                for number in range(1, exam.question_count + 1)
+            }
+            if question is not None
+            else {}
+        )
         seen = set()
         cleaned = []
         for item in value:
@@ -207,6 +221,10 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
             if bad or not set(letters).issubset(allowed):
                 raise serializers.ValidationError(
                     f"Question {number} has an invalid option."
+                )
+            if not question.allow_multiple and len(letters) > 1:
+                raise serializers.ValidationError(
+                    f"Question {number} allows only one selected option."
                 )
             cleaned.append({"question_number": number, "selected_options": letters})
         return cleaned

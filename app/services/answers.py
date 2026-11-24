@@ -1,28 +1,29 @@
 from app.models.exams import Exam, Question
 
 
-def ensure_exam_questions(
+def ensure_exam_question(
     exam: Exam,
     answers_by_number: dict[int, list[str]],
-) -> list[Question]:
-    questions = list(exam.questions.order_by("pk"))
-    maximum_number = max(answers_by_number, default=len(questions))
+) -> Question:
+    question = Question.objects.filter(exam=exam).first()
+    if question is not None:
+        return question
 
-    while len(questions) < maximum_number:
-        question_number = len(questions) + 1
-        options = answers_by_number.get(question_number, [])
-        options_count = max(
-            4,
-            max(
-                (ord(option.upper()) - ord("A") + 1 for option in options),
-                default=4,
+    options_count = max(
+        4,
+        max(
+            (
+                ord(option.upper()) - ord("A") + 1
+                for options in answers_by_number.values()
+                for option in options
             ),
-        )
-        question = Question.objects.create(
-            exam=exam,
-            options_count=options_count,
-            allow_multiple=len(set(options)) > 1,
-        )
-        questions.append(question)
-
-    return questions
+            default=4,
+        ),
+    )
+    return Question.objects.create(
+        exam=exam,
+        options_count=options_count,
+        allow_multiple=any(
+            len(set(options)) > 1 for options in answers_by_number.values()
+        ),
+    )

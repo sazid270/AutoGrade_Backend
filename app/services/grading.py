@@ -5,7 +5,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from app.models.exams import Exam
+from app.models.exams import Exam, Question
 from app.models.results import Result
 from app.models.scanning import AnswerSheet, StudentAnswer
 from app.models.students import Student
@@ -24,23 +24,23 @@ logger = logging.getLogger(__name__)
 def validate_exam_ready(exam: Exam) -> None:
     if exam.exam_type != Exam.Type.MCQ:
         raise ValueError("Only MCQ exams can be scanned.")
-    questions = list(exam.questions.order_by("pk"))
-    if not questions:
-        raise ValueError("Add at least one MCQ question before scanning sheets.")
+    question_count = exam.question_count
+    if question_count < 1:
+        raise ValueError("Set a positive question_count on the exam before scanning.")
+    question = Question.objects.filter(exam=exam).first()
+    if question is None:
+        raise ValueError("Add the MCQ question paper and settings before scanning.")
     answers = list(exam.answers.order_by("question_number"))
-    if len(answers) != len(questions):
+    if [answer.question_number for answer in answers] != list(
+        range(1, question_count + 1)
+    ):
         raise ValueError("Add an answer row for every exam question.")
     if any(answer.needs_review for answer in answers):
         raise ValueError("Review every flagged answer key before scanning.")
-    if any(
-        answer.question_id != questions[index].pk
-        for index, answer in enumerate(answers)
-    ):
-        raise ValueError("Every MCQ must have a matching answer key.")
-    total = exam.mcq_mark * len(questions)
+    total = exam.mcq_mark * question_count
     if total > exam.marks:
         raise ValueError(
-            f"The answer key is worth {total} marks ({len(questions)} questions "
+            f"The answer key is worth {total} marks ({question_count} questions "
             f"x {exam.mcq_mark}) but the exam total is {exam.marks}. "
             "Fix the exam marks or per-question mark."
         )
@@ -60,7 +60,7 @@ def calculate_mcq_marks(exam: Exam, selected_answers: dict[int, list[str]]) -> D
             score += exam.mcq_mark
         else:
             score -= penalty
-    maximum = exam.mcq_mark * len(rows)
+    maximum = exam.mcq_mark * exam.question_count
     return min(maximum, max(Decimal("0"), score)).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
@@ -133,8 +133,8 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
     exam = initial.batch.exam
     validate_sheet_image(initial.image)
     validate_exam_ready(exam)
-    questions = list(exam.questions.order_by("pk"))
-    question_numbers = list(range(1, len(questions) + 1))
+    question = Question.objects.get(exam=exam)
+    question_numbers = list(range(1, exam.question_count + 1))
     started = time.monotonic()
     layout_error = ""
     try:
@@ -145,8 +145,7 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
             initial.batch.template.structure,
             question_numbers,
             multi_allowed={
-                number: question.allow_multiple
-                for number, question in enumerate(questions, start=1)
+                number: question.allow_multiple for number in question_numbers
             },
         )
     except TemplateMismatch as exc:
