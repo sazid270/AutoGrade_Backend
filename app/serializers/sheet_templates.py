@@ -38,6 +38,8 @@ class SheetTemplateSerializer(serializers.ModelSerializer):
             "registration_digits": len(
                 fields.get("registration", {}).get("digits", [])
             ),
+            "canvas": structure.get("canvas"),
+            "grids": structure.get("grids", {}),
         }
 
     def get_status(self, _obj):

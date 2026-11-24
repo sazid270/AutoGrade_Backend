@@ -23,6 +23,27 @@ def _binary(norm: np.ndarray) -> np.ndarray:
     return cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
 
+def grid_bounds(circles: np.ndarray) -> list[float]:
+    radius = circles[:, 2] / 2
+    return [
+        round(float((circles[:, 0] - radius).min()), 1),
+        round(float((circles[:, 1] - radius).min()), 1),
+        round(float((circles[:, 0] + radius).max()), 1),
+        round(float((circles[:, 1] + radius).max()), 1),
+    ]
+
+
+def _solidity(bw: np.ndarray, contour: np.ndarray) -> float:
+    x, y, w, h = cv2.boundingRect(contour)
+    mask = np.zeros((h, w), np.uint8)
+    cv2.drawContours(mask, [contour - np.array([x, y])], -1, 255, -1)
+    area = cv2.countNonZero(mask)
+    if not area:
+        return 0.0
+    filled = cv2.bitwise_and(bw[y : y + h, x : x + w], mask)
+    return cv2.countNonZero(filled) / area
+
+
 def _find_markers(gray: np.ndarray) -> np.ndarray | None:
     h0, w0 = gray.shape
     scale = min(1.0, 1600 / max(h0, w0))
@@ -46,7 +67,11 @@ def _find_markers(gray: np.ndarray) -> np.ndarray | None:
                 continue
             if not 0.75 <= rw / rh <= 1.33 or cv2.contourArea(contour) / area < 0.8:
                 continue
-            if x0 <= cx < x1 and y0 <= cy < y1 and (best is None or area > best[2]):
+            if not (x0 <= cx < x1 and y0 <= cy < y1):
+                continue
+            if _solidity(bw, contour) < 0.85:
+                continue
+            if best is None or area > best[2]:
                 best = (cx / scale, cy / scale, area)
         if best is None:
             return None
@@ -146,10 +171,22 @@ def annotate_components(
         x1 = int(np.max(component[:, 0] + component[:, 2]))
         y1 = int(np.max(component[:, 1] + component[:, 2]))
         cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 0, 255), 3)
+        label = f"GRID {index + 1}"
+        (label_width, label_height), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+        )
+        baseline = min(annotated.shape[0] - 4, y1 + label_height + 10)
+        cv2.rectangle(
+            annotated,
+            (x0, baseline - label_height - 6),
+            (x0 + label_width + 8, baseline + 6),
+            (255, 255, 255),
+            -1,
+        )
         cv2.putText(
             annotated,
-            f"GRID {index + 1}",
-            (x0, max(24, y0 - 8)),
+            label,
+            (x0 + 4, baseline),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0, 0, 255),
@@ -160,7 +197,10 @@ def annotate_components(
 
 
 def mask_to_components(
-    aligned: np.ndarray, components: list[np.ndarray], pad: float = 3.0
+    aligned: np.ndarray,
+    components: list[np.ndarray],
+    pad: float = 3.0,
+    pad_top: float = 4.0,
 ) -> np.ndarray:
     height, width = aligned.shape
     masked = np.full_like(aligned, 255)
@@ -168,7 +208,7 @@ def mask_to_components(
         diameter = float(np.median(component[:, 2]))
         x0 = max(0, int(component[:, 0].min() - pad * diameter))
         x1 = min(width, int(component[:, 0].max() + pad * diameter))
-        y0 = max(0, int(component[:, 1].min() - pad * diameter))
+        y0 = max(0, int(component[:, 1].min() - pad_top * diameter))
         y1 = min(height, int(component[:, 1].max() + pad * diameter))
         masked[y0:y1, x0:x1] = aligned[y0:y1, x0:x1]
     return masked

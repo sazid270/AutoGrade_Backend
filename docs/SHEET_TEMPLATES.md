@@ -12,7 +12,10 @@ without an AI call per sheet.
 The sheet needs four corner markers, an answer grid, and a roll-number digit
 grid with ten bubbles per digit. A registration grid is optional. Templates
 show their detected question count, option counts, numbering, and digit counts
-in `structure_summary`. If numbering was detected incorrectly, update it with
+in `structure_summary`. The summary also includes the aligned canvas dimensions
+and grid bounding boxes in `[x0, y0, x1, y1]` coordinates. Older templates
+without grid metadata return an empty `grids` object. If numbering was detected
+incorrectly, update it with
 `PATCH /api/app/sheet-templates/{id}/` and `numbering: "column"` or `"row"`.
 A template used by a batch cannot be changed or deleted. Sheets that do not fit
 the template go to review as `layout_mismatch`.
@@ -20,14 +23,17 @@ the template go to review as `layout_mismatch`.
 ## AI and privacy
 
 AI is used to create or replace a template and to extract an answer key. Batch
-sheet reading uses local OpenCV processing.
+sheet reading uses local OpenCV processing. During template creation, OpenCV
+detects bubble geometry and counts; AI only classifies detected groups,
+question numbering, and digit order. Answer choices are labeled left to right
+as A, B, C, and so on, so non-standard printed option orders are not supported.
 
 Configure `COARENA_API_KEY`, `COARENA_BASE_URL`, `COARENA_MODEL`,
 `COARENA_MAX_TOKENS`, and `COARENA_REASONING_EFFORT`. The default model is
 `deepseek-v4-1-flash-1017`; Coarena's catalog lists it as vision-capable with
 base64 image support. `COARENA_MAX_TOKENS` defaults to `16384`. The reasoning
-effort is omitted when empty; for the default model, `none` is supported and is
-the `.env.example` value. Use only values supported by the selected model.
+effort is omitted when empty; for the default model, `none` is supported. Use
+only values supported by the selected model.
 
 Coarena stores requests and responses and may use them in datasets it licenses.
 Template creation sends an aligned image with pixels outside detected bubble

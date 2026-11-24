@@ -11,7 +11,19 @@ from app.services.ai_provider import (
     request_ai_provider,
 )
 from app.utils import omr
-from app.utils.options import BENGALI_DIGITS, normalize_option_label
+from app.utils.options import BENGALI_DIGITS
+
+ROLE_ALIASES = {
+    "answer": "answers",
+    "answers": "answers",
+    "roll": "roll",
+    "roll_no": "roll",
+    "roll_number": "roll",
+    "registration": "registration",
+    "registration_no": "registration",
+    "registration_number": "registration",
+    "reg": "registration",
+}
 
 
 class TemplateMismatch(Exception):
@@ -36,53 +48,45 @@ def load_gray(image) -> np.ndarray:
 
 
 def _label_components(aligned: np.ndarray, components: list[np.ndarray]) -> dict:
-    candidates = []
-    for index, circles in enumerate(components, start=1):
-        diameter = float(np.median(circles[:, 2]))
-        xs = omr._groups(circles[:, 0], 2.7 * diameter)
-        ys = omr._groups(circles[:, 1], 0.8 * diameter)
-        candidates.append(
-            {
-                "grid_id": index,
-                "bubbles": len(circles),
-                "x_groups": len(xs),
-                "y_groups": len(ys),
-                "bounds": [
-                    round(float(circles[:, 0].min()), 1),
-                    round(float(circles[:, 1].min()), 1),
-                    round(float(circles[:, 0].max()), 1),
-                    round(float(circles[:, 1].max()), 1),
-                ],
-            }
-        )
+    candidates = [
+        {
+            "grid_id": index,
+            "bounds": [
+                round(float(circles[:, 0].min()), 1),
+                round(float(circles[:, 1].min()), 1),
+                round(float(circles[:, 0].max()), 1),
+                round(float(circles[:, 1].max()), 1),
+            ],
+        }
+        for index, circles in enumerate(components, start=1)
+    ]
     prompt = (
-        "Classify the numbered bubble groups on this answer-sheet image. The red "
-        "rectangles and GRID labels identify computer-detected groups; one logical "
-        "grid may be split into several groups, so label every fragment with the same "
-        "role. Do not estimate coordinates. Return only JSON with a grids array, "
-        "question_count, options_per_question, option_labels, roll_digit_count, and "
-        "registration_digit_count (null when absent). Counts refer to the full logical "
-        "grid, not each fragment. For each group include "
-        '"grid_id", "role" (answers, roll, registration, or ignore), "numbering" '
-        '(column or row for answers), and "digit_order" (the ten digits from top to '
-        "bottom for roll/registration). For the answer grid, return option_labels as "
-        "one array per question in printed question order, with one label per visible "
-        "bubble, from left to right. Count the visible bubbles separately for every "
-        "question; do not assume all questions have the same number of options. "
-        "Only identify a group as roll/registration if "
-        "it is a 10-choice digit bubble grid. A digit_order must contain each of "
-        '0 through 9 exactly once. Example: {"grids":[{"grid_id":1,"role":"answers",'
-        '"numbering":"column"},{"grid_id":2,"role":"roll","digit_order":'
-        '["0","1","2","3","4","5","6","7","8","9"]}],"question_count":2,'
-        '"options_per_question":[4,2],"option_labels":[["A","B","C","D"],'
-        '["A","B"]],"roll_digit_count":6,"registration_digit_count":null}'
-        " Output exactly one valid JSON object, with no prose or markdown."
+        "The image is a scanned OMR answer sheet. Computer-detected bubble groups "
+        "are outlined in red and labelled GRID 1, GRID 2, and so on. Classify each "
+        "group. Do not count anything and do not estimate coordinates. Roles: "
+        '"answers" (rows of choice bubbles such as ক খ গ ঘ or A B C D beside question '
+        'numbers), "roll" or "registration" (a grid of digit columns, ten bubbles '
+        'per column), or "ignore". One logical grid can be split into several '
+        "groups; give every fragment the same role. For answers groups add "
+        '"numbering": "column" if question numbers continue down one column before '
+        'moving to the next column, or "row" if they continue across the row first. '
+        'For roll and registration groups add "digit_order": the ten digits printed '
+        "in the bubbles of one digit column, from top to bottom. Use the printed "
+        'heading above each digit grid: the grid under "রোল নম্বর" (Roll) has role '
+        '"roll" and the grid under "রেজিস্ট্রেশন নম্বর" (Registration) has role '
+        '"registration". Each of these roles belongs to at most one group. If a '
+        "heading is absent, no group gets that role. Return exactly one "
+        "JSON object and nothing else, in this shape: "
+        '{"grids":[{"grid_id":1,"role":"roll","digit_order":'
+        '["0","1","2","3","4","5","6","7","8","9"]},'
+        '{"grid_id":2,"role":"answers","numbering":"column"}]}'
+        f"\nDetected groups: {candidates}"
     )
     masked = omr.mask_to_components(aligned, components)
     image = omr.annotate_components(masked, components)
     response = request_ai_provider(
         [
-            {"type": "text", "text": prompt + f"\nDetected groups: {candidates}"},
+            {"type": "text", "text": prompt},
             array_content(image, quality=90),
         ]
     )
@@ -143,12 +147,26 @@ def extract_template(image) -> dict[str, Any]:
         "registration": [],
     }
     for grid_id, label in by_id.items():
-        role = label.get("role")
-        if isinstance(role, str) and role in roles:
+        role = ROLE_ALIASES.get(
+            str(label.get("role", "")).strip().lower().replace(" ", "_")
+        )
+        if role in roles:
             roles[role].append((grid_id, label))
+    for field_name in ("roll", "registration"):
+        if len(roles[field_name]) > 1:
+            ids = ", ".join(str(grid_id) for grid_id, _ in roles[field_name])
+            raise TemplateExtractionError(
+                f"The AI labeled grids {ids} as {field_name}, but a sheet has "
+                "only one. Try again or use a clearer reference sheet."
+            )
     if not roles["answers"] or not roles["roll"]:
+        summary = ", ".join(
+            f"GRID {grid_id}={label.get('role')!r}"
+            for grid_id, label in sorted(by_id.items())
+        )
         raise TemplateExtractionError(
-            "An answer grid and a roll digit grid are required."
+            "An answer grid and a roll digit grid are required. "
+            f"The AI labeled: {summary}."
         )
 
     numbering_values = [label.get("numbering") for _, label in roles["answers"]]
@@ -175,65 +193,27 @@ def extract_template(image) -> dict[str, Any]:
         raise TemplateExtractionError(
             f"The answer grid could not be verified geometrically: {detail}"
         )
+    answer_circles = np.concatenate(
+        [components[grid_id - 1] for grid_id, _ in roles["answers"]], axis=0
+    )
+    grids = {
+        "answers": {
+            "bounds": omr.grid_bounds(answer_circles),
+            "columns": len({question["col"] for question in answers["questions"]}),
+            "questions": len(answers["questions"]),
+            "numbering": numbering,
+        }
+    }
     order = omr.question_order(answers, numbering)
     options_per_question = [len(answers["questions"][row]["bubbles"]) for row in order]
     if not options_per_question or any(
         not 2 <= count <= 10 for count in options_per_question
     ):
         raise TemplateExtractionError("The detected answer grid is incomplete.")
-    question_count = classification.get("question_count")
-    if type(question_count) is not int:
-        raise TemplateExtractionError(
-            "The AI returned an invalid question count; "
-            f"OpenCV detected {len(options_per_question)} questions."
-        )
-    if question_count != len(options_per_question):
-        reported_options = classification.get("options_per_question")
-        if not isinstance(reported_options, list) or any(
-            type(count) is not int for count in reported_options
-        ):
-            reported_options = "invalid"
-        raise TemplateExtractionError(
-            f"The AI reported {question_count} questions; "
-            f"OpenCV detected {len(options_per_question)}. "
-            f"Options per question: AI={reported_options}, "
-            f"OpenCV={options_per_question}."
-        )
-    reported_options = classification.get("options_per_question")
-    if not isinstance(reported_options, list) or any(
-        type(count) is not int for count in reported_options
-    ):
-        raise TemplateExtractionError(
-            "The AI returned invalid options-per-question counts."
-        )
-    if reported_options != options_per_question:
-        raise TemplateExtractionError(
-            f"The AI reported {reported_options} options per question; "
-            f"OpenCV detected {options_per_question}."
-        )
-    raw_option_labels = classification.get("option_labels")
-    if not isinstance(raw_option_labels, list) or len(raw_option_labels) != len(order):
-        raise TemplateExtractionError(
-            "The AI did not identify every answer option label."
-        )
-    option_labels_by_row = [[] for _ in answers["questions"]]
-    for row_index, labels, expected_count in zip(
-        order,
-        raw_option_labels,
-        options_per_question,
-    ):
-        if not isinstance(labels, list) or len(labels) != expected_count:
-            raise TemplateExtractionError(
-                "The AI's option labels do not match the detected bubbles."
-            )
-        normalized = [normalize_option_label(label) for label in labels]
-        if any(label is None for label in normalized) or len(set(normalized)) != len(
-            normalized
-        ):
-            raise TemplateExtractionError(
-                "The AI returned invalid or duplicate option labels."
-            )
-        option_labels_by_row[row_index] = normalized
+    option_labels_by_row = [
+        [chr(65 + index) for index in range(len(question["bubbles"]))]
+        for question in answers["questions"]
+    ]
 
     fields = {}
     for field_name in ("roll", "registration"):
@@ -265,20 +245,15 @@ def extract_template(image) -> dict[str, Any]:
                 f"The {field_name} grid does not contain ten bubbles per digit."
             )
         field["required"] = field_name == "roll"
-        expected_count = classification.get(f"{field_name}_digit_count")
-        if type(expected_count) is not int or expected_count != len(field["digits"]):
-            raise TemplateExtractionError(
-                f"The AI's {field_name} digit count does not match the detected grid."
-            )
         fields[field_name] = field
-    if not roles["registration"] and classification.get(
-        "registration_digit_count"
-    ) not in (None, 0):
-        raise TemplateExtractionError(
-            "The AI identified a registration grid that was not detected."
-        )
+        grids[field_name] = {
+            "bounds": omr.grid_bounds(np.concatenate(circles, axis=0)),
+            "digits": len(field["digits"]),
+        }
 
     return {
+        "canvas": [omr.CANVAS_W, omr.CANVAS_H],
+        "grids": grids,
         "answers": answers,
         "numbering": numbering,
         "options_per_question": options_per_question,
