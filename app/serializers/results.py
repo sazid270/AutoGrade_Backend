@@ -7,6 +7,10 @@ from app.models.results import Result
 
 # Result serializers
 class ResultSerializer(serializers.ModelSerializer):
+    total_marks = serializers.DecimalField(
+        max_digits=7, decimal_places=2, read_only=True
+    )
+
     class Meta:
         model = Result
         fields = "__all__"
@@ -14,7 +18,6 @@ class ResultSerializer(serializers.ModelSerializer):
             "exam",
             "student",
             "sheet",
-            "total_marks",
             "is_overridden",
             "updated_by",
             "created_at",
@@ -73,9 +76,5 @@ class ResultSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         if set(validated_data) - {"finalized"}:
             validated_data["is_overridden"] = True
-        if "mcq_marks" in validated_data or "cq_marks" in validated_data:
-            validated_data["total_marks"] = validated_data.get(
-                "mcq_marks", instance.mcq_marks
-            ) + (validated_data.get("cq_marks", instance.cq_marks) or Decimal("0"))
         validated_data["updated_by"] = self.context["request"].user
         return super().update(instance, validated_data)

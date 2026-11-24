@@ -79,9 +79,8 @@ def _update_result_from_sheet(result: Result, sheet: AnswerSheet) -> None:
     result.sheet = sheet
     result.mcq_marks = sheet.scanned_mcq_marks
     result.cq_marks = None
-    result.recalculate()
     result.save(
-        update_fields=("sheet", "mcq_marks", "cq_marks", "total_marks", "updated_at")
+        update_fields=("sheet", "mcq_marks", "cq_marks", "updated_at")
     )
 
 
@@ -357,7 +356,6 @@ def process_sheet(sheet_id: int) -> AnswerSheet:
                 defaults={
                     "sheet": sheet,
                     "mcq_marks": sheet.scanned_mcq_marks,
-                    "total_marks": sheet.scanned_mcq_marks,
                 },
             )
             _update_result_from_sheet(result, sheet)
@@ -423,7 +421,6 @@ def resolve_sheet(sheet_id: int, user) -> AnswerSheet:
         defaults={
             "sheet": sheet,
             "mcq_marks": sheet.scanned_mcq_marks,
-            "total_marks": sheet.scanned_mcq_marks,
         },
     )
     _update_result_from_sheet(result, sheet)

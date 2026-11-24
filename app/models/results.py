@@ -26,7 +26,6 @@ class Result(TimeStampMixin):
     cq_marks = models.DecimalField(
         max_digits=7, decimal_places=2, null=True, blank=True
     )
-    total_marks = models.DecimalField(max_digits=7, decimal_places=2, default=0)
     is_overridden = models.BooleanField(default=False)
     finalized = models.BooleanField(default=False)
     updated_by = models.ForeignKey(
@@ -43,6 +42,6 @@ class Result(TimeStampMixin):
     def __str__(self):
         return f"{self.exam} - {self.student}"
 
-    def recalculate(self):
-        self.total_marks = self.mcq_marks + (self.cq_marks or Decimal("0"))
-        return self
+    @property
+    def total_marks(self):
+        return self.mcq_marks + (self.cq_marks or Decimal("0"))
